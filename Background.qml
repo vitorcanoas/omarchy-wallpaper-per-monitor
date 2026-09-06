@@ -219,6 +219,22 @@ Item {
     }
   }
 
+  // Target is intentionally "background", the SAME target the native
+  // omarchy.background plugin uses -- even though omarchy.background is
+  // listed in shell.json's disabledPlugins (and quickshell logs a benign
+  // "Handler was registered but will not be used" warning about it, since
+  // the disabled plugin's own IpcHandler never actually runs). This is load
+  // bearing, not a leftover: Omarchy's own CLI drives the shell through IPC
+  // on this exact target --
+  //   /usr/share/omarchy/bin/omarchy-theme-bg-set -> `omarchy-shell -q background set "$BACKGROUND"`
+  //   /usr/share/omarchy/bin/omarchy-theme-set    -> `shell_ipc background themeTransition ...`
+  // -- so `omarchy theme bg set` and `omarchy theme set` (theme switching,
+  // with the cross-fade) both call target "background" with no way to point
+  // them at a plugin-specific target instead. Renaming this to e.g.
+  // "background-per-monitor" would silently break both commands: they would
+  // keep exiting 0 (fire-and-forget IPC) while the on-screen wallpaper never
+  // updates. Kept as "background" on purpose; the log line is cosmetic
+  // noise from the disabled plugin, not a real conflict.
   IpcHandler {
     target: "background"
 

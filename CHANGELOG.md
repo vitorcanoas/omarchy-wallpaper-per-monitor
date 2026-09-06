@@ -2,6 +2,31 @@
 
 All notable changes to Omarchy Wallpaper Per Monitor are documented here.
 
+## [Unreleased]
+
+### Fixed
+
+- `install.sh` ignored a test `HOME` override and silently wrote into the
+  real user's `~/.config/omarchy/shell.json` and plugin directory. The cause
+  was not `~` expansion (there was none in the script) but
+  `${XDG_CONFIG_HOME:-$HOME/.config}` / `${XDG_BIN_HOME:-$HOME/.local/bin}`:
+  a desktop session exports `XDG_CONFIG_HOME` as an absolute path to the
+  real home, so that fallback took priority over `$HOME` and ignored it
+  entirely, while `XDG_BIN_HOME` (unset) correctly fell through to `$HOME`
+  -- explaining why only the `bin/` symlinks respected the fake `HOME` in
+  testing. Now resolved directly from `"$HOME"` (`"$HOME/.config/omarchy"`,
+  `"$HOME/.local/bin"`), matching how Omarchy's own migrations resolve
+  `shell.json`. Verified with `HOME=<fake> bash install.sh`: every file
+  landed under the fake home, and the real `shell.json` was confirmed
+  byte-for-byte and mtime-identical before and after.
+- Documented (no target change) the `IpcHandler { target: "background" }`
+  collision warning logged by `Background.qml` when the native
+  `omarchy.background` plugin is disabled. The shared target is load
+  bearing: `omarchy theme bg set` and `omarchy theme set` both drive the
+  shell via `omarchy-shell -q background set|themeTransition ...`, so this
+  plugin must keep answering on `background` to stay wired to Omarchy's own
+  CLI. The warning is cosmetic.
+
 ## [0.1.0] - 2026-09-06
 
 ### Added
