@@ -12,8 +12,14 @@
 #      nothing the running shell needs).
 #   2. Registers the plugin and disables the native one in
 #      ~/.config/omarchy/shell.json (backed up first).
-#   3. Symlinks wallpaper-monitor, wp and omarchy-wallpaper-render into
-#      ~/.local/bin, so they work as bare commands from anywhere.
+#   3. Symlinks wallpaper-monitor, wp, omarchy-wallpaper-render and
+#      wallpaper-monitor-menu into ~/.local/bin, so they work as bare commands
+#      from anywhere.
+#   4. Adds a "Wallpaper per monitor" row to the SUPER+SPACE menu, by
+#      appending a marker-delimited block to
+#      ~/.config/omarchy/extensions/omarchy-menu.jsonc (backed up first, and
+#      edited as text -- it is JSONC, so it is never re-serialized as JSON;
+#      see add_menu_entry below).
 #
 # DRY_RUN=1 ./install.sh prints every step above without touching the real
 # plugin directory or the real shell.json -- it copies into a throwaway
@@ -63,6 +69,46 @@ esac
 OMARCHY_CONFIG_DIR="$HOME/.config/omarchy"
 BIN_DIR="$HOME/.local/bin"
 
+# The SUPER+SPACE menu is extended through this JSONC file, which Omarchy's
+# shell merges over its own default menu at runtime (watchChanges: true, so an
+# edit shows up without restarting the shell).
+MENU_JSONC="$OMARCHY_CONFIG_DIR/extensions/omarchy-menu.jsonc"
+
+# Our menu row is delimited by these comment markers so it can be removed
+# again byte-for-byte. See add_menu_entry() for why the file is edited as
+# TEXT and never re-serialized as JSON.
+MENU_MARK_BEGIN="// >>> $PLUGIN_ID (managed by install.sh -- do not edit inside)"
+MENU_MARK_END="// <<< $PLUGIN_ID"
+
+# The menu row itself.
+#
+# id "style.wallpaper-per-monitor": a NEW id under the existing "style"
+# submenu, so the row lands right next to the native "Background" it
+# complements. Reusing an existing id would OVERRIDE that native entry rather
+# than sit beside it -- "style.background" in particular is the native theme
+# wallpaper row, and taking it over would remove a feature while adding ours.
+#
+# aliases deliberately avoid "background" and "wallpaper": the native
+# "style.background" already claims both, and duplicating them would make
+# typing "wallpaper" return two competing rows. "per-monitor" and
+# "monitor-wallpaper" are unambiguous, and `description` gives the search
+# index extra words to match on without that collision.
+#
+# The action is a bare command, not the native
+# `x=$(switcher); [[ -n $x ]] && apply "$x"` two-step: our script runs the
+# whole flow (pick monitor -> pick image -> apply) and already exits 0 without
+# applying anything when the user cancels, so there is no intermediate value
+# for the menu to test.
+menu_entry_line() {
+  printf '  "style.wallpaper-per-monitor": {"icon":"󰹑","label":"Wallpaper per monitor","aliases":["per-monitor","monitor-wallpaper"],"description":"Set a different wallpaper on each monitor","action":"wallpaper-monitor-menu"},\n'
+}
+
+menu_entry_block() {
+  printf '%s\n' "$MENU_MARK_BEGIN"
+  menu_entry_line
+  printf '%s\n' "$MENU_MARK_END"
+}
+
 # Single cleanup trap for the whole script (DRY_RUN staging dir and/or the
 # real-path TMP_JSON below) -- a second `trap ... EXIT` would silently
 # replace this one rather than stack, so anything that needs cleanup on exit
@@ -70,6 +116,7 @@ BIN_DIR="$HOME/.local/bin"
 cleanup() {
   [[ -n "${STAGE:-}" ]] && rm -rf "$STAGE"
   [[ -n "${TMP_JSON:-}" ]] && rm -f "$TMP_JSON"
+  [[ -n "${TMP_MENU:-}" ]] && rm -f "$TMP_MENU"
   return 0
 }
 trap cleanup EXIT
@@ -86,6 +133,15 @@ if [[ $DRY_RUN == 1 ]]; then
     cp "$OMARCHY_CONFIG_DIR/shell.json" "$SHELL_JSON"
   else
     printf '{}\n' >"$SHELL_JSON"
+  fi
+  # Same for the menu extension file: seed the staging copy from the real one
+  # (when it exists) so the dry run reports exactly what a real run would do
+  # -- in particular whether our block is already present.
+  real_menu_jsonc="$MENU_JSONC"
+  MENU_JSONC="$STAGE/extensions/omarchy-menu.jsonc"
+  mkdir -p "$STAGE/extensions"
+  if [[ -f "$real_menu_jsonc" ]]; then
+    cp "$real_menu_jsonc" "$MENU_JSONC"
   fi
   printf 'DRY RUN: no real files under ~/.config/omarchy or ~/.local/bin will be touched.\n'
   printf 'DRY RUN: staging in %s\n\n' "$STAGE"
@@ -138,7 +194,7 @@ rsync -a --delete \
   --exclude 'docs/' \
   --exclude '*.bak.*' \
   "$HERE"/ "$PLUGIN_DIR"/
-chmod +x "$PLUGIN_DIR/bin/wallpaper-monitor" "$PLUGIN_DIR/bin/wp" "$PLUGIN_DIR/bin/omarchy-wallpaper-render"
+chmod +x "$PLUGIN_DIR/bin/wallpaper-monitor" "$PLUGIN_DIR/bin/wp" "$PLUGIN_DIR/bin/omarchy-wallpaper-render" "$PLUGIN_DIR/bin/wallpaper-monitor-menu"
 
 # --- 1b. Pre-flight check that all 3 symlinks CAN be created ---------------
 #
@@ -181,6 +237,7 @@ mkdir -p "$BIN_DIR"
 check_link_one wallpaper-monitor
 check_link_one wp
 check_link_one omarchy-wallpaper-render
+check_link_one wallpaper-monitor-menu
 
 # --- 2 & 3. Register the plugin and disable the native one ----------------
 #
@@ -273,6 +330,90 @@ MSG
 link_one wallpaper-monitor
 link_one wp
 link_one omarchy-wallpaper-render
+link_one wallpaper-monitor-menu
+
+# --- 5. Add the row to the SUPER+SPACE menu --------------------------------
+#
+# ~/.config/omarchy/extensions/omarchy-menu.jsonc is merged over Omarchy's own
+# default menu at runtime. Adding a row there is what makes the plugin
+# reachable from SUPER+SPACE; the plugin itself stays kinds:["service"] (a
+# kind:"menu" plugin opens a SEPARATE window over IPC, it does not add a row
+# to the main menu, so it is not what we want here).
+#
+# THIS FILE IS EDITED AS TEXT, NEVER RE-SERIALIZED.
+#
+# It is the user's own file and it is JSONC: comments and trailing commas are
+# legal in it, and both are things a strict JSON parser rejects. Round-tripping
+# it through jq/python would either fail outright or -- worse -- succeed and
+# silently write back a normalized file with every one of the user's comments
+# deleted. So we only ever append or cut a block delimited by our own comment
+# markers, leaving every other byte exactly as it was.
+#
+# Idempotent: a run that finds the markers already present changes nothing.
+# Reversible: uninstall.sh cuts the same marker block back out.
+add_menu_entry() {
+  local dir
+  dir="$(dirname "$MENU_JSONC")"
+  mkdir -p "$dir"
+
+  # Nothing to merge into yet -- create the minimal valid JSONC object. (The
+  # file Omarchy ships as an example is all comments plus an empty {}.)
+  if [[ ! -f $MENU_JSONC ]]; then
+    printf '{\n}\n' >"$MENU_JSONC"
+    printf '==> created %s\n' "$MENU_JSONC"
+  fi
+
+  if grep -qF "$MENU_MARK_BEGIN" "$MENU_JSONC"; then
+    printf 'menu entry already present in %s\n' "$MENU_JSONC"
+    return 0
+  fi
+
+  # The row must land INSIDE the top-level object, so insert it before the
+  # LAST "}" in the file rather than appending at EOF. Refuse rather than
+  # guess if there is no closing brace to insert before -- appending after it
+  # would produce a file the shell cannot parse, silently killing the user's
+  # own menu extensions along with ours.
+  if ! grep -q '}' "$MENU_JSONC"; then
+    cat >&2 <<MSG
+$MENU_JSONC has no closing "}" -- it does not look like the JSONC object this
+installer knows how to extend. Refusing to edit it.
+
+Everything else was installed. To add the menu row by hand, put this line
+inside the top-level object of that file:
+
+$(menu_entry_line)
+
+MSG
+    return 0
+  fi
+
+  # Back up before touching a hand-edited, human-owned file -- same rule and
+  # same nanosecond-resolution timestamp as the shell.json backup above.
+  local backup="$MENU_JSONC.bak.$(date +%Y%m%d-%H%M%S-%N)"
+  cp "$MENU_JSONC" "$backup"
+  printf '==> backed up %s -> %s\n' "$MENU_JSONC" "$backup"
+
+  # temp + mv, so a failure part-way through never leaves a truncated menu
+  # file behind (an unparseable one costs the user their whole menu).
+  TMP_MENU="$(mktemp)"
+  # awk, not sed: we insert before the LAST closing brace, which needs a
+  # one-pass buffer, and awk keeps every other line byte-identical.
+  awk -v blk="$(menu_entry_block)" '
+    { lines[NR] = $0 }
+    /}/ { last = NR }
+    END {
+      for (i = 1; i <= NR; i++) {
+        if (i == last) print blk
+        print lines[i]
+      }
+    }
+  ' "$MENU_JSONC" >"$TMP_MENU"
+  mv "$TMP_MENU" "$MENU_JSONC"
+  TMP_MENU=""
+  printf '==> added menu entry to %s\n' "$MENU_JSONC"
+}
+
+add_menu_entry
 
 case ":$PATH:" in
   *":$BIN_DIR:"*) ;;
@@ -283,6 +424,12 @@ if [[ $DRY_RUN == 1 ]]; then
   printf '\nDRY RUN complete. Nothing under ~/.config/omarchy or ~/.local/bin was changed.\n'
   printf 'Resulting shell.json would contain:\n'
   jq '{plugins, disabledPlugins}' "$SHELL_JSON"
+  printf '\nResulting menu extension block:\n'
+  if [[ -f $MENU_JSONC ]]; then
+    sed -n "/$(printf '%s' "$MENU_MARK_BEGIN" | sed 's/[][\.*^$/]/\\&/g')/,/$(printf '%s' "$MENU_MARK_END" | sed 's/[][\.*^$/]/\\&/g')/p" "$MENU_JSONC"
+  fi
 else
   printf '\nInstalled. Restart omarchy-shell (or your session) to load the plugin.\n'
+  printf 'The menu row appears under Style > Wallpaper per monitor (SUPER+SPACE);\n'
+  printf 'the menu extension file is watched live, so that part needs no restart.\n'
 fi

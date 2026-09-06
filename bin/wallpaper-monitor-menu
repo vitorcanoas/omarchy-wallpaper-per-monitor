@@ -1,0 +1,384 @@
+#!/usr/bin/env bash
+# wallpaper-monitor-menu -- seletor visual de wallpaper por monitor.
+#
+# Fluxo: escolhe MONITOR -> escolhe IMAGEM -> aplica via `wallpaper-monitor set`.
+#
+# E a entrada de menu (SUPER+SPACE) do plugin
+# vitorcanoas.background-per-monitor. Modelado no switcher nativo
+# /usr/share/omarchy/bin/omarchy-theme-bg-switcher, com duas diferencas:
+#
+#   1. pergunta ANTES em qual monitor aplicar (o nativo so tem um wallpaper
+#      global), e
+#   2. abre o catalogo da ORIENTACAO daquele monitor -- oferecer arte deitada
+#      para um monitor em pe rende tarja preta nas laterais, que foi
+#      exatamente o problema que este plugin existe para resolver.
+#
+# Cancelar em qualquer etapa sai 0 sem aplicar nada: o usuario que abre o
+# menu e desiste nao quer um erro na tela.
+#
+# NAO reimplementa a escrita do override -- chama `wallpaper-monitor set`,
+# que ja serializa com lock, migra formato antigo e grava atomicamente.
+
+set -euo pipefail
+
+# LC_ALL=C pelo mesmo motivo do `wp`: fixa a ordem em que os catalogos sao
+# lidos, para que a lista nao mude entre um terminal interativo e uma chamada
+# vinda do keybind do menu.
+export LC_ALL=C
+
+SELF="$(readlink -f "${BASH_SOURCE[0]}")"
+SELF_DIR="$(dirname "$SELF")"
+
+# O CLI vizinho, resolvido ao lado deste script (ele e symlinkado em
+# ~/.local/bin, e readlink -f acima ja desfez o symlink). Cai para o PATH se
+# por algum motivo nao estiver ao lado.
+CLI="$SELF_DIR/wallpaper-monitor"
+[[ -x $CLI ]] || CLI="wallpaper-monitor"
+
+OVERRIDE_JSON="$HOME/.config/omarchy/background-per-monitor.json"
+
+# Mesma validacao de nome de conector do `wp`: o pipeline abaixo e delimitado
+# por newline/TAB, entao um nome contendo um desses seria truncado no meio e o
+# override iria parar num monitor que nao existe.
+MONITOR_RE='^[A-Za-z0-9._:-]+$'
+
+erro() { printf 'erro: %s\n' "$1" >&2; }
+
+# ---------------------------------------------------------------------------
+# Diretorios de arte.
+#
+# NAO chumbar ~/Pictures/wallpapers-rick-and-morty: esse e o catalogo pessoal
+# DESTE usuario, nao uma propriedade do plugin. Ordem de resolucao:
+#
+#   1. $WALLPAPER_MONITOR_DIR                -- override explicito
+#   2. $HOME/Pictures/wallpapers/render      -- default generico
+#   3. o diretorio que ja contem os overrides gravados no JSON
+#
+# O item 3 e o que faz isto funcionar sem configuracao nenhuma para quem ja
+# usa o plugin: se ha um override apontando para
+# .../algum-catalogo/render/16x9/arte.png, o catalogo esta a dois niveis
+# acima dele. Descobrir dai e mais honesto que adivinhar um nome de pasta.
+#
+# NOTA: deliberadamente NAO se reusa a base do `wp` (BASE=$(dirname $0)/..,
+# R=$BASE/render). Quando o `wp` roda pelo symlink em ~/.local/bin, esse BASE
+# resolve para o diretorio do plugin instalado, que nao tem render/ nenhum --
+# o `wp` so acerta quando chamado de dentro do checkout do catalogo. Repetir
+# essa resolucao aqui herdaria o mesmo bug.
+raiz_do_override() {
+  [[ -f $OVERRIDE_JSON ]] || return 1
+  python3 - "$OVERRIDE_JSON" <<'PYEOF' 2>/dev/null || return 1
+import json
+import os
+import sys
+
+MAX_BYTES = 1 << 20  # mesmo teto do wallpaper-monitor
+
+try:
+    if os.path.getsize(sys.argv[1]) > MAX_BYTES:
+        sys.exit(1)
+    with open(sys.argv[1], "rb") as fh:
+        data = json.loads(fh.read().decode("utf-8"))
+except (OSError, ValueError, UnicodeDecodeError):
+    sys.exit(1)
+
+if not isinstance(data, dict):
+    sys.exit(1)
+
+caminhos = []
+monitors = data.get("monitors")
+if isinstance(monitors, dict):
+    caminhos.extend(v for v in monitors.values() if isinstance(v, str))
+for chave in ("portrait", "landscape"):
+    v = data.get(chave)
+    if isinstance(v, str):
+        caminhos.append(v)
+# Formato antigo (plano): valores string direto na raiz.
+if not isinstance(monitors, dict):
+    caminhos.extend(
+        v for k, v in data.items()
+        if isinstance(v, str) and k not in ("portrait", "landscape")
+    )
+
+for caminho in caminhos:
+    # .../<raiz>/16x9/arte.png -> <raiz>
+    pasta = os.path.dirname(caminho)
+    if os.path.basename(pasta) not in ("16x9", "9x16"):
+        continue
+    raiz = os.path.dirname(pasta)
+    if os.path.isdir(os.path.join(raiz, "16x9")) or os.path.isdir(
+        os.path.join(raiz, "9x16")
+    ):
+        print(raiz)
+        sys.exit(0)
+sys.exit(1)
+PYEOF
+}
+
+resolve_raiz() {
+  local raiz
+  if [[ -n ${WALLPAPER_MONITOR_DIR:-} ]]; then
+    # Configurado explicitamente: se estiver errado, dizer isso em vez de
+    # cair calado para outro caminho -- um fallback silencioso aqui aplicaria
+    # arte de um catalogo que o usuario nao pediu.
+    if [[ ! -d $WALLPAPER_MONITOR_DIR ]]; then
+      erro "WALLPAPER_MONITOR_DIR aponta para um diretorio que nao existe: $WALLPAPER_MONITOR_DIR"
+      return 1
+    fi
+    printf '%s\n' "$WALLPAPER_MONITOR_DIR"
+    return 0
+  fi
+
+  if [[ -d "$HOME/Pictures/wallpapers/render" ]]; then
+    printf '%s\n' "$HOME/Pictures/wallpapers/render"
+    return 0
+  fi
+
+  if raiz="$(raiz_do_override)" && [[ -n $raiz && -d $raiz ]]; then
+    printf '%s\n' "$raiz"
+    return 0
+  fi
+
+  cat >&2 <<MSG
+erro: nao encontrei o catalogo de wallpapers.
+
+Este menu espera um diretorio com duas subpastas de orientacao:
+
+    <catalogo>/16x9/   artes deitadas  (monitor em paisagem)
+    <catalogo>/9x16/   artes em pe     (monitor em retrato)
+
+Aponte o seu com a variavel de ambiente WALLPAPER_MONITOR_DIR, por exemplo
+no ~/.bashrc ou ~/.zshrc:
+
+    export WALLPAPER_MONITOR_DIR="\$HOME/Pictures/meus-wallpapers/render"
+
+Para gerar esse catalogo a partir de imagens soltas, veja
+omarchy-wallpaper-render.
+MSG
+  return 1
+}
+
+# ---------------------------------------------------------------------------
+# Monitores.
+#
+# Mesma correcao de transform do `wp` (mon_por_orientacao): hyprctl reporta a
+# dimensao FISICA do modo, e transform impar (90/270 graus) inverte w/h na
+# tela. Sem isso um monitor 1920x1080 rotacionado seria classificado como
+# paisagem e receberia arte deitada de lado.
+#
+# Saida: uma linha por monitor ativo, campos separados por TAB:
+#   <nome>\t<w>\t<h>\t<portrait|landscape>
+lista_monitores() {
+  command -v hyprctl >/dev/null 2>&1 || {
+    erro "hyprctl nao encontrado (sem Hyprland rodando?)"
+    return 1
+  }
+
+  local raw=""
+  raw="$(hyprctl monitors -j 2>/dev/null)" || raw=""
+
+  # JSON por argv, nao por stdin: com heredoc, stdin do python seria o proprio
+  # script. Mesmo cuidado ja tomado em wallpaper-monitor cmd_list.
+  python3 - "$raw" <<'PYEOF'
+import json
+import sys
+
+raw = sys.argv[1]
+if not raw.strip():
+    sys.exit(1)
+try:
+    monitores = json.loads(raw)
+except ValueError:
+    sys.exit(1)
+if not isinstance(monitores, list):
+    sys.exit(1)
+
+for m in monitores:
+    if not isinstance(m, dict):
+        continue
+    nome = m.get("name")
+    if not nome:
+        continue
+    # Monitor desativado nao mostra nada; gravar override nele parece dar
+    # certo e nao muda nada na tela.
+    if m.get("disabled"):
+        continue
+    w = m.get("width")
+    h = m.get("height")
+    if not isinstance(w, int) or not isinstance(h, int):
+        continue
+    t = m.get("transform", 0)
+    if not isinstance(t, int):
+        t = 0
+    # transform impar = rotacionado -> inverte w/h para a geometria logica
+    w, h = (h, w) if t % 2 else (w, h)
+    orient = "portrait" if h > w else "landscape"
+    print(f"{nome}\t{w}\t{h}\t{orient}")
+PYEOF
+}
+
+# Le o override atual de um monitor, para passar como --selected. Vazio quando
+# nao ha nenhum -- o seletor apenas nao pre-seleciona nada.
+override_atual() {  # $1 = nome do monitor
+  [[ -f $OVERRIDE_JSON ]] || return 0
+  python3 - "$OVERRIDE_JSON" "$1" <<'PYEOF' 2>/dev/null || return 0
+import json
+import os
+import sys
+
+MAX_BYTES = 1 << 20
+
+try:
+    if os.path.getsize(sys.argv[1]) > MAX_BYTES:
+        sys.exit(0)
+    with open(sys.argv[1], "rb") as fh:
+        data = json.loads(fh.read().decode("utf-8"))
+except (OSError, ValueError, UnicodeDecodeError):
+    sys.exit(0)
+
+if not isinstance(data, dict):
+    sys.exit(0)
+
+monitor = sys.argv[2]
+monitors = data.get("monitors")
+if isinstance(monitors, dict):
+    valor = monitors.get(monitor)
+else:
+    # Formato antigo (plano).
+    valor = data.get(monitor)
+
+if isinstance(valor, str) and valor:
+    print(valor)
+PYEOF
+}
+
+# ---------------------------------------------------------------------------
+main() {
+  if (( $# > 0 )); then
+    cat >&2 <<'MSG'
+uso: wallpaper-monitor-menu
+
+Sem argumentos. Abre o seletor de monitor e, em seguida, o seletor de imagem
+da orientacao correspondente, e aplica a escolha.
+
+Variaveis de ambiente:
+  WALLPAPER_MONITOR_DIR   diretorio do catalogo (contendo 16x9/ e 9x16/)
+MSG
+    exit 1
+  fi
+
+  for dep in omarchy-menu-select omarchy-menu-images python3; do
+    command -v "$dep" >/dev/null 2>&1 || {
+      erro "$dep nao encontrado (Omarchy instalado?)"
+      exit 1
+    }
+  done
+
+  local raiz
+  raiz="$(resolve_raiz)" || exit 1
+
+  local monitores
+  monitores="$(lista_monitores)" || {
+    erro "nao foi possivel ler os monitores (hyprctl monitors -j falhou)"
+    exit 1
+  }
+  if [[ -z $monitores ]]; then
+    erro "nenhum monitor ativo detectado"
+    exit 1
+  fi
+
+  # Monta as opcoes do seletor de lista. O formato de uma opcao e
+  # "<glyph>\t<label>\t<subtexto>"; o omarchy-menu-select devolve
+  # "<label>\t<subtexto>" quando ha subtexto. Usamos o NOME DO CONECTOR como
+  # subtexto justamente porque ele e a chave estavel: dois monitores do mesmo
+  # modelo teriam o mesmo label, e sem o subtexto nao daria para saber qual
+  # linha foi escolhida.
+  local -a opcoes=() nomes=() orients=()
+  local nome w h orient glyph rotulo
+  while IFS=$'\t' read -r nome w h orient; do
+    [[ -n $nome ]] || continue
+    if [[ ! $nome =~ $MONITOR_RE ]]; then
+      erro "hyprctl reportou um nome de monitor inesperado: '$nome' (ignorado)"
+      continue
+    fi
+    if [[ $orient == portrait ]]; then
+      glyph=""
+      rotulo="$nome -- ${w}x${h} (em pe)"
+    else
+      glyph="󰍹"
+      rotulo="$nome -- ${w}x${h} (deitado)"
+    fi
+    opcoes+=("$(printf '%s\t%s\t%s' "$glyph" "$rotulo" "$nome")")
+    nomes+=("$nome")
+    orients+=("$orient")
+  done <<<"$monitores"
+
+  if (( ${#nomes[@]} == 0 )); then
+    erro "nenhum monitor utilizavel detectado"
+    exit 1
+  fi
+
+  local monitor="" orientacao=""
+  if (( ${#nomes[@]} == 1 )); then
+    # Um monitor so: perguntar em qual aplicar seria uma tela a mais sem
+    # nenhuma escolha nela.
+    monitor="${nomes[0]}"
+    orientacao="${orients[0]}"
+  else
+    local escolha=""
+    # Cancelar sai != 0 no omarchy-menu-select; nao e erro nosso.
+    escolha="$(omarchy-menu-select "Wallpaper do monitor" "${opcoes[@]}")" || exit 0
+    [[ -n $escolha ]] || exit 0
+
+    # A resposta e "<label>\t<subtexto>"; o subtexto e o nome do conector.
+    local chave="${escolha##*$'\t'}"
+    [[ -n $chave ]] || exit 0
+
+    local i
+    for i in "${!nomes[@]}"; do
+      if [[ ${nomes[$i]} == "$chave" ]]; then
+        monitor="${nomes[$i]}"
+        orientacao="${orients[$i]}"
+        break
+      fi
+    done
+    if [[ -z $monitor ]]; then
+      erro "monitor escolhido nao reconhecido: '$chave'"
+      exit 1
+    fi
+  fi
+
+  local sub
+  [[ $orientacao == portrait ]] && sub="9x16" || sub="16x9"
+  local dir="$raiz/$sub"
+  if [[ ! -d $dir ]]; then
+    erro "catalogo $sub nao existe em $raiz (esperado: $dir)"
+    exit 1
+  fi
+
+  local atual=""
+  atual="$(override_atual "$monitor")" || atual=""
+
+  # --selected pre-marca o wallpaper que o monitor ja usa. O seletor nativo
+  # aceita um caminho inexistente sem reclamar (ele so nao pre-marca nada),
+  # mas conferir aqui evita passar lixo adiante.
+  local -a args=(--filterable --show-labels)
+  if [[ -n $atual && -f $atual ]]; then
+    args+=(--selected "$atual")
+  fi
+
+  local imagem=""
+  # Cancelar imprime vazio (e pode sair !=0); nos dois casos, sai 0 sem aplicar.
+  imagem="$(omarchy-menu-images "${args[@]}" "$dir")" || exit 0
+  [[ -n $imagem ]] || exit 0
+
+  if [[ ! -f $imagem ]]; then
+    erro "o seletor devolveu um caminho que nao e um arquivo: $imagem"
+    exit 1
+  fi
+
+  # Aplica pelo CLI existente -- ele valida o monitor, serializa a escrita e
+  # grava atomicamente. Propaga o codigo de saida dele.
+  exec "$CLI" set "$monitor" "$imagem"
+}
+
+main "$@"

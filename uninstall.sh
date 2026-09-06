@@ -4,7 +4,13 @@
 #
 # Reverses exactly what install.sh does, in reverse order:
 #
-#   1. Removes wallpaper-monitor, wp and omarchy-wallpaper-render from
+#   0. Removes the "Wallpaper per monitor" row from the SUPER+SPACE menu, by
+#      cutting the marker-delimited block install.sh appended to
+#      ~/.config/omarchy/extensions/omarchy-menu.jsonc. Only that block is
+#      touched; the rest of the file (the user's own rows and comments) is
+#      preserved byte for byte, and a backup is made first.
+#   1. Removes wallpaper-monitor, wp, omarchy-wallpaper-render and
+#      wallpaper-monitor-menu from
 #      ~/.local/bin -- but ONLY if each is a symlink pointing at THIS
 #      plugin's installed bin/ directory. A file or a symlink to something
 #      else is left alone (it is not ours to remove).
@@ -55,10 +61,16 @@ esac
 OMARCHY_CONFIG_DIR="$HOME/.config/omarchy"
 BIN_DIR="$HOME/.local/bin"
 OVERRIDE_JSON="$OMARCHY_CONFIG_DIR/background-per-monitor.json"
+MENU_JSONC="$OMARCHY_CONFIG_DIR/extensions/omarchy-menu.jsonc"
+
+# Must match install.sh exactly -- these delimit the block we appended.
+MENU_MARK_BEGIN="// >>> $PLUGIN_ID (managed by install.sh -- do not edit inside)"
+MENU_MARK_END="// <<< $PLUGIN_ID"
 
 cleanup() {
   [[ -n "${STAGE:-}" ]] && rm -rf "$STAGE"
   [[ -n "${TMP_JSON:-}" ]] && rm -f "$TMP_JSON"
+  [[ -n "${TMP_MENU:-}" ]] && rm -f "$TMP_MENU"
   return 0
 }
 trap cleanup EXIT
@@ -79,8 +91,16 @@ if [[ $DRY_RUN == 1 ]]; then
   if [[ -d "$OMARCHY_CONFIG_DIR/plugins/$PLUGIN_ID" ]]; then
     cp -a "$OMARCHY_CONFIG_DIR/plugins/$PLUGIN_ID" "$PLUGIN_DIR"
   fi
+  # Mirror the menu extension file too, so the dry run reports whether our
+  # block is really there and what removing it would leave behind.
+  real_menu_jsonc="$MENU_JSONC"
+  MENU_JSONC="$STAGE/extensions/omarchy-menu.jsonc"
+  mkdir -p "$STAGE/extensions"
+  if [[ -f "$real_menu_jsonc" ]]; then
+    cp "$real_menu_jsonc" "$MENU_JSONC"
+  fi
   real_plugin_dir="$OMARCHY_CONFIG_DIR/plugins/$PLUGIN_ID"
-  for name in wallpaper-monitor wp omarchy-wallpaper-render; do
+  for name in wallpaper-monitor wp omarchy-wallpaper-render wallpaper-monitor-menu; do
     real_link="$HOME/.local/bin/$name"
     if [[ -L $real_link ]]; then
       real_target="$(readlink -f "$real_link")"
@@ -117,7 +137,65 @@ MSG
   exit 1
 fi
 
-# --- 1. Remove the 3 symlinks from ~/.local/bin, but only our own ---------
+# --- 0. Remove our row from the SUPER+SPACE menu ---------------------------
+#
+# Cuts exactly the marker-delimited block install.sh appended to the user's
+# JSONC menu extension, and nothing else. The file is edited as TEXT for the
+# same reason install.sh writes it as text: it is JSONC (comments, trailing
+# commas), so parsing it as JSON would either fail or silently rewrite the
+# user's file with all their comments stripped.
+#
+# Nothing found -> nothing done, and we say so (idempotent: a second run is a
+# no-op, not an error).
+remove_menu_entry() {
+  if [[ ! -f $MENU_JSONC ]]; then
+    printf 'not present, skipping: %s\n' "$MENU_JSONC"
+    return 0
+  fi
+
+  if ! grep -qF "$MENU_MARK_BEGIN" "$MENU_JSONC"; then
+    printf 'no menu entry of ours in %s -- nothing to remove.\n' "$MENU_JSONC"
+    return 0
+  fi
+
+  # If the closing marker is missing, the block has been hand-edited and we
+  # cannot tell where it ends. Deleting from the opening marker to EOF would
+  # eat the user's own rows below it, so refuse and let them look.
+  if ! grep -qF "$MENU_MARK_END" "$MENU_JSONC"; then
+    cat >&2 <<MSG
+$MENU_JSONC contains our opening marker but not the closing one:
+
+    $MENU_MARK_END
+
+The block has been edited by hand and its end cannot be determined safely.
+Leaving the file alone -- remove the row for
+"style.wallpaper-per-monitor" yourself.
+
+MSG
+    return 0
+  fi
+
+  local backup="$MENU_JSONC.bak.$(date +%Y%m%d-%H%M%S-%N)"
+  cp "$MENU_JSONC" "$backup"
+  printf '==> backed up %s -> %s\n' "$MENU_JSONC" "$backup"
+
+  TMP_MENU="$(mktemp)"
+  # awk with fixed-string comparison (index/==), never a regex: the markers
+  # contain "/" and "." and ">", which in a regex would match more than the
+  # literal marker line.
+  awk -v b="$MENU_MARK_BEGIN" -v e="$MENU_MARK_END" '
+    index($0, b) { skip = 1; next }
+    skip && index($0, e) { skip = 0; next }
+    !skip { print }
+  ' "$MENU_JSONC" >"$TMP_MENU"
+  mv "$TMP_MENU" "$MENU_JSONC"
+  TMP_MENU=""
+  printf '==> removed menu entry from %s\n' "$MENU_JSONC"
+}
+
+remove_menu_entry
+
+# --- 1. Remove the symlinks from ~/.local/bin, but only our own -----------
 #
 # "Our own" means: a symlink whose resolved target lives inside THIS
 # plugin's installed bin/ directory. Anything else (a real file, a symlink
@@ -149,6 +227,7 @@ unlink_one() {
 unlink_one wallpaper-monitor
 unlink_one wp
 unlink_one omarchy-wallpaper-render
+unlink_one wallpaper-monitor-menu
 
 # --- 2. Unregister the plugin and (conditionally) restore the native one --
 if [[ -f $SHELL_JSON ]]; then

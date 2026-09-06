@@ -15,9 +15,82 @@ set -uo pipefail
 export LC_ALL=C
 
 SELF="$(readlink -f "${BASH_SOURCE[0]}")"
-BASE="$(cd "$(dirname "$SELF")/.." && pwd)"
-R="$BASE/render"
 CLI="$(dirname "$SELF")/wallpaper-monitor"
+[[ -x $CLI ]] || CLI="wallpaper-monitor"
+
+# Raiz do catalogo de artes. A resolucao acompanha a do wallpaper-monitor-menu
+# -- as duas precisam achar o MESMO catalogo, senao o numero que o menu mostra
+# e o que o `wp` aplica divergem.
+#
+# Ordem: $WALLPAPER_MONITOR_DIR > ~/Pictures/wallpapers/render > a raiz
+# deduzida dos overrides ja gravados > o checkout ao lado deste script.
+#
+# O ultimo item era, ate aqui, o UNICO criterio (BASE=$(dirname $0)/..), e por
+# isso `wp h` rodado pelo symlink de ~/.local/bin resolvia para a pasta do
+# plugin instalado -- que nao tem render/ nenhum. O comando entao imprimia
+# "(sem 16x9)" e saia 0, como se o catalogo estivesse vazio: falha silenciosa,
+# indistinguivel de "nao ha artes". So acertava chamado de dentro do checkout.
+resolve_raiz_wp() {
+  if [[ -n ${WALLPAPER_MONITOR_DIR:-} ]]; then
+    # Configurado a mao: se estiver errado, dizer -- cair calado para outro
+    # caminho aplicaria arte de um catalogo que o usuario nao pediu.
+    if [[ ! -d $WALLPAPER_MONITOR_DIR ]]; then
+      echo "erro: WALLPAPER_MONITOR_DIR aponta para diretorio inexistente: $WALLPAPER_MONITOR_DIR" >&2
+      return 1
+    fi
+    printf '%s\n' "$WALLPAPER_MONITOR_DIR"
+    return 0
+  fi
+
+  [[ -d "$HOME/Pictures/wallpapers/render" ]] && {
+    printf '%s\n' "$HOME/Pictures/wallpapers/render"; return 0; }
+
+  # Deduz do override ja gravado: um caminho .../catalogo/render/16x9/arte.png
+  # coloca a raiz dois niveis acima do arquivo.
+  local j="$HOME/.config/omarchy/background-per-monitor.json" raiz
+  if [[ -f $j ]]; then
+    raiz="$(python3 - "$j" <<'PYEOF' 2>/dev/null || true
+import json, os, sys
+try:
+    if os.path.getsize(sys.argv[1]) > (1 << 20):
+        sys.exit(1)
+    with open(sys.argv[1], "rb") as fh:
+        d = json.loads(fh.read().decode("utf-8"))
+except (OSError, ValueError, UnicodeDecodeError):
+    sys.exit(1)
+if not isinstance(d, dict):
+    sys.exit(1)
+p = []
+m = d.get("monitors")
+if isinstance(m, dict):
+    p.extend(v for v in m.values() if isinstance(v, str))
+for k in ("portrait", "landscape"):
+    v = d.get(k)
+    if isinstance(v, str):
+        p.append(v)
+for c in p:
+    r = os.path.dirname(os.path.dirname(c))
+    if os.path.isdir(r):
+        print(r)
+        break
+PYEOF
+)"
+    [[ -n $raiz && -d $raiz ]] && { printf '%s\n' "$raiz"; return 0; }
+  fi
+
+  # Ultimo recurso: o checkout ao lado deste script.
+  local base
+  base="$(cd "$(dirname "$SELF")/.." && pwd)"
+  [[ -d "$base/render" ]] && { printf '%s\n' "$base/render"; return 0; }
+  return 1
+}
+
+if ! R="$(resolve_raiz_wp)"; then
+  echo "erro: catalogo de artes nao encontrado." >&2
+  echo "      defina WALLPAPER_MONITOR_DIR apontando para a pasta que contem" >&2
+  echo "      os subdiretorios 16x9/ e 9x16/, ou crie ~/Pictures/wallpapers/render." >&2
+  exit 1
+fi
 
 # Nomes de monitor aceitos. O pipeline abaixo (print -> grep -c -> head -n1) e
 # delimitado por newline, entao um nome contendo \n seria truncado no meio e o
