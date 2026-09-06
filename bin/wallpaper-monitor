@@ -1,0 +1,387 @@
+#!/usr/bin/env bash
+# wallpaper-monitor -- gerencia overrides de wallpaper por monitor (e por
+# orientacao) para o plugin vitorcanoas.background
+# (~/.config/omarchy/plugins/vitorcanoas.background).
+#
+# O override fica em ~/.config/omarchy/background-per-monitor.json, formato
+# novo (migrado automaticamente a partir do formato antigo plano):
+#   {
+#     "monitors": { "DP-2": "/caminho/a.png", "HDMI-A-1": "/caminho/b.png" },
+#     "portrait": "/caminho/vertical-padrao.png",
+#     "landscape": "/caminho/horizontal-padrao.png"
+#   }
+#
+# Formato antigo (ainda lido pelo plugin, mas este CLI migra para o novo
+# assim que grava algo): { "DP-2": "/a.png", "HDMI-A-1": "/b.png" }
+#
+# Precedencia no plugin: monitors[nome] > portrait/landscape (conforme
+# height > width pos-rotacao) > symlink nativo do Omarchy.
+#
+# O plugin QML observa esse arquivo ao vivo (FileView watchChanges: true) --
+# nao e preciso reiniciar o shell depois de set/clear.
+#
+# Ideia de fallback por orientacao portada do PR upstream #10249 (DCPRevere,
+# omacom/omarchy, https://github.com/omacom/omarchy/pull/10249).
+
+set -euo pipefail
+
+OVERRIDE_JSON="${HOME}/.config/omarchy/background-per-monitor.json"
+
+usage() {
+  cat >&2 <<EOF
+Uso:
+  wallpaper-monitor set <MONITOR> <caminho-imagem>   grava override para o monitor
+  wallpaper-monitor set-portrait <caminho-imagem>    grava o default de retrato (portrait)
+  wallpaper-monitor set-landscape <caminho-imagem>   grava o default de paisagem (landscape)
+  wallpaper-monitor list                             mostra overrides + defaults + monitores detectados
+  wallpaper-monitor clear <MONITOR>                  remove override do monitor
+  wallpaper-monitor clear-portrait                   remove o default de retrato
+  wallpaper-monitor clear-landscape                  remove o default de paisagem
+
+Exemplos:
+  wallpaper-monitor set DP-2 ~/Pictures/wallpapers-rick-and-morty/render/16x9/unico-b-rick-morty-battle-dark-8000.png
+  wallpaper-monitor set-portrait ~/Pictures/wallpapers-rick-and-morty/render/9x16/retrato-rick-amoled-02.png
+  wallpaper-monitor clear HDMI-A-1
+  wallpaper-monitor list
+
+Formato antigo (plano, sem a chave "monitors") e migrado automaticamente para
+o formato novo na primeira escrita deste CLI; um backup .bak e feito antes.
+EOF
+  exit 1
+}
+
+ensure_json_exists() {
+  if [[ ! -f "$OVERRIDE_JSON" ]]; then
+    mkdir -p "$(dirname "$OVERRIDE_JSON")"
+    printf '{\n  "monitors": {}\n}\n' > "$OVERRIDE_JSON"
+  fi
+}
+
+# Migra o JSON do formato antigo (plano, sem "monitors") para o novo
+# ({"monitors": {...}}), preservando o conteudo. Faz backup antes. E
+# idempotente: se ja estiver no formato novo, nao faz nada (nem backup).
+migrate_if_needed() {
+  ensure_json_exists
+
+  local needs_migration
+  needs_migration="$(python3 - "$OVERRIDE_JSON" <<'PYEOF'
+import json
+import sys
+
+json_path = sys.argv[1]
+try:
+    with open(json_path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+except (ValueError, OSError) as e:
+    print(f"aviso: JSON ilegivel em {json_path} ({e}) -- tratando como formato antigo/vazio", file=sys.stderr)
+    data = {}
+
+if isinstance(data, dict) and "monitors" in data and isinstance(data["monitors"], dict):
+    print("no")
+else:
+    print("yes")
+PYEOF
+)"
+
+  if [[ "$needs_migration" != "yes" ]]; then
+    return 0
+  fi
+
+  local bak
+  bak="${OVERRIDE_JSON}.bak.$(date +%Y%m%d-%H%M%S)"
+  cp -- "$OVERRIDE_JSON" "$bak"
+  echo "aviso: JSON no formato antigo detectado -- migrando para o formato novo (backup: $bak)" >&2
+
+  local tmp
+  tmp="$(mktemp "${OVERRIDE_JSON}.XXXXXX")"
+  trap 'rm -f "$tmp"' EXIT
+
+  python3 - "$OVERRIDE_JSON" "$tmp" <<'PYEOF'
+import json
+import sys
+
+json_path, tmp_path = sys.argv[1:3]
+
+try:
+    with open(json_path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+except (ValueError, OSError) as e:
+    print(f"aviso: JSON ilegivel em {json_path} ({e}) -- migrando a partir de vazio", file=sys.stderr)
+    data = {}
+
+if not isinstance(data, dict):
+    data = {}
+
+# Formato antigo: objeto plano monitor -> caminho. Formato novo: tudo isso
+# vira o mapa "monitors", preservando chaves que ja porventura sejam
+# "portrait"/"landscape" so se o objeto ja tiver "monitors" (o que a funcao
+# chamadora ja garantiu que nao e o caso aqui).
+migrated = {"monitors": data}
+
+with open(tmp_path, "w", encoding="utf-8") as f:
+    json.dump(migrated, f, indent=2, ensure_ascii=False)
+    f.write("\n")
+PYEOF
+
+  mv "$tmp" "$OVERRIDE_JSON"
+  trap - EXIT
+}
+
+# Resolve um caminho de imagem para absoluto e confere que existe.
+resolve_image() {
+  local image="$1"
+  local abs_image
+  abs_image="$(realpath -m -- "$image")"
+  if [[ ! -f "$abs_image" ]]; then
+    echo "erro: arquivo de imagem nao existe: $abs_image" >&2
+    exit 1
+  fi
+  printf '%s' "$abs_image"
+}
+
+cmd_set() {
+  local monitor="${1:-}"
+  local image="${2:-}"
+
+  if [[ -z "$monitor" || -z "$image" ]]; then
+    echo "erro: uso: wallpaper-monitor set <MONITOR> <caminho-imagem>" >&2
+    exit 1
+  fi
+
+  local abs_image
+  abs_image="$(resolve_image "$image")"
+
+  migrate_if_needed
+
+  local tmp
+  tmp="$(mktemp "${OVERRIDE_JSON}.XXXXXX")"
+  trap 'rm -f "$tmp"' EXIT
+
+  python3 - "$OVERRIDE_JSON" "$monitor" "$abs_image" "$tmp" <<'PYEOF'
+import json
+import sys
+
+json_path, monitor, image, tmp_path = sys.argv[1:5]
+
+try:
+    with open(json_path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+except (ValueError, OSError) as e:
+    print(f"aviso: JSON ilegivel em {json_path} ({e}) -- recomecando do zero", file=sys.stderr)
+    data = {}
+if not isinstance(data, dict):
+    data = {}
+if not isinstance(data.get("monitors"), dict):
+    data["monitors"] = {}
+
+data["monitors"][monitor] = image
+
+with open(tmp_path, "w", encoding="utf-8") as f:
+    json.dump(data, f, indent=2, ensure_ascii=False)
+    f.write("\n")
+PYEOF
+
+  mv "$tmp" "$OVERRIDE_JSON"
+  trap - EXIT
+
+  echo "ok: $monitor -> $abs_image"
+}
+
+cmd_set_orientation() {
+  local key="$1"
+  local image="${2:-}"
+
+  if [[ -z "$image" ]]; then
+    echo "erro: uso: wallpaper-monitor set-${key} <caminho-imagem>" >&2
+    exit 1
+  fi
+
+  local abs_image
+  abs_image="$(resolve_image "$image")"
+
+  migrate_if_needed
+
+  local tmp
+  tmp="$(mktemp "${OVERRIDE_JSON}.XXXXXX")"
+  trap 'rm -f "$tmp"' EXIT
+
+  python3 - "$OVERRIDE_JSON" "$key" "$abs_image" "$tmp" <<'PYEOF'
+import json
+import sys
+
+json_path, key, image, tmp_path = sys.argv[1:5]
+
+try:
+    with open(json_path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+except (ValueError, OSError) as e:
+    print(f"aviso: JSON ilegivel em {json_path} ({e}) -- recomecando do zero", file=sys.stderr)
+    data = {}
+if not isinstance(data, dict):
+    data = {}
+if not isinstance(data.get("monitors"), dict):
+    data["monitors"] = {}
+
+data[key] = image
+
+with open(tmp_path, "w", encoding="utf-8") as f:
+    json.dump(data, f, indent=2, ensure_ascii=False)
+    f.write("\n")
+PYEOF
+
+  mv "$tmp" "$OVERRIDE_JSON"
+  trap - EXIT
+
+  echo "ok: ${key} -> $abs_image"
+}
+
+cmd_clear() {
+  local monitor="${1:-}"
+
+  if [[ -z "$monitor" ]]; then
+    echo "erro: uso: wallpaper-monitor clear <MONITOR>" >&2
+    exit 1
+  fi
+
+  migrate_if_needed
+
+  local tmp
+  tmp="$(mktemp "${OVERRIDE_JSON}.XXXXXX")"
+  trap 'rm -f "$tmp"' EXIT
+
+  python3 - "$OVERRIDE_JSON" "$monitor" "$tmp" <<'PYEOF'
+import json
+import sys
+
+json_path, monitor, tmp_path = sys.argv[1:4]
+
+try:
+    with open(json_path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+except (ValueError, OSError) as e:
+    print(f"aviso: JSON ilegivel em {json_path} ({e}) -- recomecando do zero", file=sys.stderr)
+    data = {}
+if not isinstance(data, dict):
+    data = {}
+if isinstance(data.get("monitors"), dict):
+    data["monitors"].pop(monitor, None)
+
+with open(tmp_path, "w", encoding="utf-8") as f:
+    json.dump(data, f, indent=2, ensure_ascii=False)
+    f.write("\n")
+PYEOF
+
+  mv "$tmp" "$OVERRIDE_JSON"
+  trap - EXIT
+
+  echo "ok: override removido para $monitor (volta ao default de orientacao ou ao wallpaper padrao)"
+}
+
+cmd_clear_orientation() {
+  local key="$1"
+
+  migrate_if_needed
+
+  local tmp
+  tmp="$(mktemp "${OVERRIDE_JSON}.XXXXXX")"
+  trap 'rm -f "$tmp"' EXIT
+
+  python3 - "$OVERRIDE_JSON" "$key" "$tmp" <<'PYEOF'
+import json
+import sys
+
+json_path, key, tmp_path = sys.argv[1:4]
+
+try:
+    with open(json_path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+except (ValueError, OSError) as e:
+    print(f"aviso: JSON ilegivel em {json_path} ({e}) -- recomecando do zero", file=sys.stderr)
+    data = {}
+if not isinstance(data, dict):
+    data = {}
+data.pop(key, None)
+
+with open(tmp_path, "w", encoding="utf-8") as f:
+    json.dump(data, f, indent=2, ensure_ascii=False)
+    f.write("\n")
+PYEOF
+
+  mv "$tmp" "$OVERRIDE_JSON"
+  trap - EXIT
+
+  echo "ok: default de ${key} removido"
+}
+
+cmd_list() {
+  migrate_if_needed
+
+  echo "== Overrides configurados ($OVERRIDE_JSON) =="
+  python3 - "$OVERRIDE_JSON" <<'PYEOF'
+import json
+import sys
+
+json_path = sys.argv[1]
+try:
+    with open(json_path, encoding="utf-8") as f:
+        data = json.load(f)
+except (ValueError, OSError) as e:
+    print(f"  (JSON ilegivel: {e})", file=sys.stderr)
+    data = {}
+
+if not isinstance(data, dict):
+    data = {}
+
+monitors = data.get("monitors")
+monitors = monitors if isinstance(monitors, dict) else {}
+
+if not monitors:
+    print("  (nenhum override de monitor definido)")
+else:
+    for monitor, path in monitors.items():
+        print(f"  {monitor} -> {path}")
+
+print()
+print("  portrait  -> " + data.get("portrait", "(nao definido)"))
+print("  landscape -> " + data.get("landscape", "(nao definido)"))
+PYEOF
+
+  echo
+  echo "== Monitores detectados (hyprctl monitors -j) =="
+  if command -v hyprctl >/dev/null 2>&1; then
+    hyprctl monitors -j | python3 - <<'PYEOF'
+import json
+import sys
+
+raw = sys.stdin.read()
+try:
+    monitors = json.loads(raw) if raw.strip() else []
+except ValueError as e:
+    print(f"  (falha ao ler hyprctl monitors -j: {e})", file=sys.stderr)
+    monitors = []
+
+for m in monitors:
+    print(f"  {m['name']} ({m['width']}x{m['height']}, transform={m.get('transform', 0)})")
+PYEOF
+  else
+    echo "  (hyprctl nao encontrado)"
+  fi
+}
+
+main() {
+  local action="${1:-}"
+  shift || true
+
+  case "$action" in
+    set)             cmd_set "$@" ;;
+    set-portrait)    cmd_set_orientation portrait "$@" ;;
+    set-landscape)   cmd_set_orientation landscape "$@" ;;
+    clear)           cmd_clear "$@" ;;
+    clear-portrait)  cmd_clear_orientation portrait ;;
+    clear-landscape) cmd_clear_orientation landscape ;;
+    list)            cmd_list "$@" ;;
+    *)               usage ;;
+  esac
+}
+
+main "$@"

@@ -1,0 +1,264 @@
+#!/usr/bin/env bash
+# render-wallpapers-v3.sh
+#
+# Correcao de premissa em relacao a v2: a v2 forcava TODAS as 25 artes nas
+# duas orientacoes (16x9 e 9x16), o que fazia arte deitada virar tarja fina
+# com fundo borrado quando espremida em 9:16 (modo fit+blur). Feio, e o
+# usuario reclamou.
+#
+# A v3 renderiza cada arte SO na orientacao em que ela nasceu, conforme o
+# levantamento em CLASSIFICACAO.md:
+#   14 DEITADAS + user-img10-upscaled.png -> so render/16x9/ (1920x1080)
+#    9 EM PE     + user-img7-upscaled.png -> so render/9x16/ (1080x1920)
+#
+# O modo fit+blur foi REMOVIDO. Se uma arte cair nele na orientacao em que
+# foi classificada, a classificacao esta errada -- o script avisa alto e
+# segue (nao aborta, para nao travar o lote inteiro por causa de uma arte).
+#
+# Reaproveitado da v2 (funcoes testadas, nao mexidas na logica core):
+#   - upscale():        Real-ESRGAN x4plus-anime, sempre -s 4 (escala fixa;
+#                        -s 2 / -s 3 corrompem em silencio), reduz depois com
+#                        Lanczos.
+#   - render_flat():     recompoe motivo centralizado sobre tela chapada
+#                        (AMOLED). Ganhou 1 parametro novo: chop sul opcional,
+#                        para descartar ruido/textura que gruda no trim.
+#   - modo cover de
+#     render_bleed():    full-bleed com razao de aspecto proxima do alvo.
+#
+# Script relocavel: nada de caminho absoluto chumbado. Base derivada de
+# $(dirname "$0")/..
+
+set -uo pipefail
+
+BASE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+SRC="$BASE"
+OUT="$SRC/render"
+DISCARD="$OUT/_descartados-v2"
+WORK="${TMPDIR:-/tmp}/wprender-v3.$$"
+MODELS="${REALESRGAN_MODELS:-/usr/share/realesrgan-ncnn-vulkan/models}"
+MODEL="realesrgan-x4plus-anime"
+MAGICK="magick"
+
+command -v magick >/dev/null 2>&1 || MAGICK="convert"
+command -v "$MAGICK" >/dev/null 2>&1 || { echo "erro: ImageMagick nao encontrado" >&2; exit 1; }
+command -v realesrgan-ncnn-vulkan >/dev/null 2>&1 || { echo "erro: realesrgan-ncnn-vulkan nao encontrado" >&2; exit 1; }
+[ -d "$MODELS" ] || { echo "erro: modelos nao encontrados em $MODELS" >&2; exit 1; }
+
+mkdir -p "$OUT/16x9" "$OUT/9x16" "$DISCARD" "$WORK"
+trap 'rm -rf "$WORK"' EXIT
+
+log()  { printf '%s\n' "$*" >&2; }
+warn() { printf '\n!!!!!! AVISO: %s !!!!!!\n\n' "$*" >&2; }
+w_of() { $MAGICK identify -format '%w' "$1"; }
+h_of() { $MAGICK identify -format '%h' "$1"; }
+
+# ---------------------------------------------------------------------------
+# upscale <in> <out> <needW> <needH>  -- reaproveitada da v2, intocada.
+# ARMADILHA: realesrgan-x4plus-anime e' modelo de escala FIXA 4x. -s 2 / -s 3
+# nao dao erro mas corrompem o conteudo em silencio. Sempre -s 4, repetindo
+# passadas se precisar de mais, reduzindo depois com Lanczos.
+# ---------------------------------------------------------------------------
+upscale() {
+  local in=$1 out=$2 needW=$3 needH=$4
+  local w h fx fy f cur n i
+  w=$(w_of "$in"); h=$(h_of "$in")
+  fx=$(awk -v a="$needW" -v b="$w" 'BEGIN{print a/b}')
+  fy=$(awk -v a="$needH" -v b="$h" 'BEGIN{print a/b}')
+  f=$(awk -v a="$fx" -v b="$fy" 'BEGIN{print (a>b)?a:b}')
+  n=$(awk -v f="$f" 'BEGIN{ if (f<=1.02) print 0; else { p=0; c=1; while (c<f && p<2) { c*=4; p++ } print p } }')
+  if [ "$n" = "0" ]; then
+    cp "$in" "$out"
+    return
+  fi
+  cur="$in"
+  for ((i=1; i<=n; i++)); do
+    local step="$WORK/up.$$.$i.png"
+    log "      real-esrgan x4 (passada $i/$n) $(basename "$in")"
+    if realesrgan-ncnn-vulkan -i "$cur" -o "$step" -n "$MODEL" -m "$MODELS" -s 4 -f png >/dev/null 2>&1; then
+      [ "$cur" != "$in" ] && rm -f "$cur"
+      cur="$step"
+    else
+      log "      !! esrgan falhou, mantendo o que tem e completando com Lanczos"
+      break
+    fi
+  done
+  if [ "$cur" = "$in" ]; then
+    $MAGICK "$in" -filter Lanczos -resize "${needW}x${needH}^" "$out"
+  else
+    mv "$cur" "$out"
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# render_flat <src> <bgcolor> <fill> <target 16x9|9x16> [insetpct] [chopSouthPx]
+#   recompoe motivo centralizado sobre tela chapada. SO renderiza no target
+#   pedido (diferenca-chave da v3: v2 sempre fazia os dois).
+#   insetpct:    shave percentual nas 4 bordas antes do trim (mata borda
+#                branca de screenshot). Reaproveitado da v2.
+#   chopSouthPx: NOVO na v3. Descarta N px do rodape ANTES do trim, para
+#                remover textura/ruido (ex.: efeito "estatica de TV") que
+#                gruda na borda inferior e impede o trim de convergir no
+#                motivo real, deixando o fill artificialmente pequeno.
+# ---------------------------------------------------------------------------
+render_flat() {
+  local src=$1 bg=$2 fill=$3 target=$4 inset=${5:-0} chopS=${6:-0}
+  [ -f "$src" ] || { log "AVISO: $src nao existe -- pulando"; return; }
+  local base; base=$(basename "${src%.*}")
+  local p="$WORK/$base.prep.png" c="$WORK/$base.cont.png"
+
+  cp "$src" "$p"
+  if [ "$chopS" != "0" ]; then
+    $MAGICK "$p" -gravity South -chop "0x${chopS}" "$p"
+  fi
+  if [ "$inset" != "0" ]; then
+    $MAGICK "$p" -shave "${inset}%x${inset}%" "$p"
+  fi
+  $MAGICK "$p" -bordercolor "$bg" -border 1 -fuzz 8% -trim +repage "$c"
+
+  local cw ch; cw=$(w_of "$c"); ch=$(h_of "$c")
+  log "   [flat] $base -> $target  motivo ${cw}x${ch} sobre $bg  fill=$fill"
+
+  local W H; [ "$target" = "16x9" ] && { W=1920; H=1080; } || { W=1080; H=1920; }
+  local boxW boxH
+  boxW=$(awk -v a="$W" -v f="$fill" 'BEGIN{printf "%d", a*f}')
+  boxH=$(awk -v a="$H" -v f="$fill" 'BEGIN{printf "%d", a*f}')
+  local needW needH r
+  r=$(awk -v cw="$cw" -v ch="$ch" -v bw="$boxW" -v bh="$boxH" \
+      'BEGIN{ a=bw/cw; b=bh/ch; print (a<b)?a:b }')
+  needW=$(awk -v cw="$cw" -v r="$r" 'BEGIN{printf "%d", cw*r}')
+  needH=$(awk -v ch="$ch" -v r="$r" 'BEGIN{printf "%d", ch*r}')
+  local up="$WORK/$base.$target.up.png"
+  upscale "$c" "$up" "$needW" "$needH"
+  $MAGICK -size "${W}x${H}" "xc:$bg" \
+    \( "$up" -filter Lanczos -resize "${boxW}x${boxH}" -unsharp 0x0.7+0.35+0.02 \) \
+    -gravity center -compose over -composite \
+    -strip -define png:compression-level=9 "$OUT/$target/$base.png"
+  rm -f "$up"
+}
+
+# ---------------------------------------------------------------------------
+# render_bleed <src> <target 16x9|9x16> [gravity] [trimbars:0|1]
+#   cover (Lanczos + extent). SO renderiza no target pedido.
+#   fit+blur foi REMOVIDO na v3: se a razao de aspecto cair fora da faixa
+#   "cover aceitavel", loga aviso alto (a classificacao deveria ter evitado
+#   isso) e segue com cover mesmo assim, para nao travar o lote.
+# ---------------------------------------------------------------------------
+render_bleed() {
+  local src=$1 target=$2 grav=${3:-center} trimbars=${4:-0}
+  [ -f "$src" ] || { log "AVISO: $src nao existe -- pulando"; return; }
+  local base; base=$(basename "${src%.*}")
+  local p="$WORK/$base.prep.png"
+
+  if [ "$trimbars" = "1" ]; then
+    $MAGICK "$src" -bordercolor black -border 1 -fuzz 6% -trim +repage "$p"
+  else
+    cp "$src" "$p"
+  fi
+
+  local sw sh sa; sw=$(w_of "$p"); sh=$(h_of "$p")
+  sa=$(awk -v w="$sw" -v h="$sh" 'BEGIN{print w/h}')
+
+  local W H ta; [ "$target" = "16x9" ] && { W=1920; H=1080; } || { W=1080; H=1920; }
+  ta=$(awk -v w="$W" -v h="$H" 'BEGIN{print w/h}')
+  local rel; rel=$(awk -v a="$sa" -v b="$ta" 'BEGIN{print a/b}')
+  local far; far=$(awk -v r="$rel" 'BEGIN{print (r>=0.78 && r<=1.28)?0:1}')
+  if [ "$far" = "1" ]; then
+    warn "$base: aspecto $sa longe do alvo $target ($ta) -- fit+blur foi removido na v3." \
+         " Classificacao pode estar errada. Seguindo com cover (crop) mesmo assim."
+  fi
+
+  log "   [bleed] $base -> $target  ${sw}x${sh}  aspect $sa  gravity $grav"
+  local up="$WORK/$base.$target.up.png"
+  upscale "$p" "$up" "$W" "$H"
+  $MAGICK "$up" -filter Lanczos -resize "${W}x${H}^" \
+    -gravity "$grav" -extent "${W}x${H}" \
+    -unsharp 0x0.6+0.30+0.02 -strip -define png:compression-level=9 \
+    "$OUT/$target/$base.png"
+  rm -f "$up"
+}
+
+# ---------------------------------------------------------------------------
+# limpa_orfaos_v2 <base-sem-ext> <target-correto>
+#   se sobrou PNG da v2 na orientacao ERRADA (arte deitada com PNG velho em
+#   9x16/, ou em pe com PNG velho em 16x9/), move para _descartados-v2/ em
+#   vez de apagar.
+# ---------------------------------------------------------------------------
+limpa_orfaos_v2() {
+  local base=$1 correto=$2
+  local errado; [ "$correto" = "16x9" ] && errado="9x16" || errado="16x9"
+  if [ -f "$OUT/$errado/$base.png" ]; then
+    log "   [orfao v2] $base.png estava em $errado/ (orientacao errada) -> _descartados-v2/"
+    mv -f "$OUT/$errado/$base.png" "$DISCARD/$base.png"
+  fi
+}
+
+cd "$SRC" || exit 1
+
+log "=== BASE: $BASE ==="
+
+log ""
+log "=== FUNDO CHAPADO (recomposicao) -- 16x9 ==="
+render_flat "unico-b-rick-amoled-5120.png"   "#090909" 0.68 16x9
+render_flat "paisagem-eyepatch-black-04.jpg" "#000000" 0.42 16x9
+# Wubba Lubba: motivo pequeno no preto (correcao v3 -- fill subido de 0.88
+# para 0.90) + chop sul de 360px pra descartar a faixa de ruido/estatica que
+# grudava na borda inferior e impedia o trim de isolar so o rosto+texto.
+render_flat "unico-b-rick-minimalista.png"   "#000000" 0.90 16x9 0 360
+
+log ""
+log "=== FUNDO CHAPADO (recomposicao) -- 9x16 ==="
+# retrato-rick-amoled-02: correcao v3 -- fill subido de 0.90 (ja estava alto
+# na v2, mantido) para 0.90; motivo minusculo boiando no preto corrigido.
+render_flat "retrato-rick-amoled-02.jpg" "#000000" 0.90 9x16
+render_flat "user-img5-upscaled.png"     "#000000" 0.85 9x16 1
+render_flat "user-img9-upscaled.png"     "#000000" 0.85 9x16 1
+
+log ""
+log "=== FULL BLEED -- 16x9 (deitadas + user-img10) ==="
+# Nota: paisagem-eyepatch-black-04 e unico-b-rick-amoled-5120 JA foram
+# renderizadas acima via render_flat (fundo chapado) -- nao repetir aqui,
+# senao a segunda chamada sobrescreveria a primeira no mesmo arquivo.
+render_bleed "extra-b-wallpapercave-stoner-03.jpg"       16x9 west
+render_bleed "google-cosmic-portal-02.jpg"               16x9 center
+render_bleed "google-minimalist-redcircle-03.jpg"        16x9 center
+render_bleed "google-starfield-dark-04.jpg"              16x9 center
+render_bleed "paisagem-minimalista-black-01.jpg"         16x9 center
+render_bleed "paisagem-portal-verde-02.png"              16x9 center
+render_bleed "extra-b-rixwn-space-02.jpg"                16x9 center   # ultrawide 2.39 -> crop lateral leve
+render_bleed "user-img6-02-upscaled.png"                 16x9 center
+render_bleed "paisagem-garagem-noturna-03.jpg"           16x9 center
+render_bleed "user-img2-upscaled.png"                    16x9 center
+render_bleed "unico-b-rick-morty-battle-dark-8000.png"   16x9 center
+render_bleed "user-img10-upscaled.png"                   16x9 center   # quase-quadrada -> cover, perda pequena
+
+log ""
+log "=== FULL BLEED -- 9x16 (em pe + user-img7) ==="
+# Nota: retrato-rick-amoled-02, user-img9 e user-img5 JA foram renderizadas
+# acima via render_flat (fundo chapado) -- nao repetir aqui.
+render_bleed "retrato-rick-morty-season8-portal-03.jpg"  9x16 center
+render_bleed "google-portal-silhouette-01.jpg"           9x16 center
+render_bleed "retrato-rick-amoled-01.png"                9x16 center
+render_bleed "user-img1-upscaled.png"                    9x16 center   # mais alta que 9:16 -> crop leve topo/base
+render_bleed "user-img4-upscaled.png"                    9x16 south
+render_bleed "user-img6-01-upscaled.png"                 9x16 center
+render_bleed "user-img7-upscaled.png"                    9x16 center   # quase-quadrada -> fit vertical, sobra pouca
+
+log ""
+log "=== LIMPEZA DE ORFAOS DA V2 (orientacao errada) ==="
+for base in extra-b-wallpapercave-stoner-03 google-cosmic-portal-02 google-minimalist-redcircle-03 \
+            google-starfield-dark-04 paisagem-eyepatch-black-04 paisagem-minimalista-black-01 \
+            paisagem-portal-verde-02 extra-b-rixwn-space-02 user-img6-02-upscaled \
+            paisagem-garagem-noturna-03 unico-b-rick-amoled-5120 user-img2-upscaled \
+            unico-b-rick-morty-battle-dark-8000 user-img10-upscaled unico-b-rick-minimalista; do
+  limpa_orfaos_v2 "$base" 16x9
+done
+for base in retrato-rick-amoled-02 retrato-rick-morty-season8-portal-03 google-portal-silhouette-01 \
+            retrato-rick-amoled-01 user-img1-upscaled user-img4-upscaled user-img6-01-upscaled \
+            user-img9-upscaled user-img5-upscaled user-img7-upscaled; do
+  limpa_orfaos_v2 "$base" 9x16
+done
+
+log ""
+log "=== PRONTO ==="
+ls -1 "$OUT/16x9" | wc -l | xargs echo "16x9:"
+ls -1 "$OUT/9x16" | wc -l | xargs echo "9x16:"

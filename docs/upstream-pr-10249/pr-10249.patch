@@ -1,0 +1,209 @@
+diff --git a/manual/39-backgrounds.md b/manual/39-backgrounds.md
+index 6edec3911cc..f984b8676e0 100644
+--- a/manual/39-backgrounds.md
++++ b/manual/39-backgrounds.md
+@@ -5,3 +5,23 @@ Every theme ships with its own set of backgrounds, and you can add extras of you
+ You can do this most easily by going to _Install > Style > Background_ in the Omarchy Menu. That'll bring up the folder where the backgrounds for that theme is stored. Hit `Super + Shift + F` to start another file manager, find your background, copy it over.  Now it'll be included in the choices of backgrounds you can select between using `Super + Ctrl + Space`.
+ 
+ You can find a huge collection of cool curated backgrounds on https://github.com/dharmx/walls.
++
++## Different backgrounds on different monitors
++
++Add an optional `background` object to `~/.config/omarchy/shell.json`, alongside the existing `version`, `bar`, and other settings:
++
++```json
++"background": {
++  "monitors": {
++    "DP-1": "~/Pictures/backgrounds/main.jpg"
++  },
++  "portrait": "~/Pictures/backgrounds/vertical.jpg",
++  "landscape": "~/Pictures/backgrounds/horizontal.jpg"
++}
++```
++
++Use the monitor names shown by `hyprctl monitors`. All settings are optional. A named monitor takes precedence over the orientation default; displays without either use the current theme background. Portrait means the display is taller than it is wide after rotation; square displays use the landscape setting. Selection updates when displays connect, rotate, or change size.
++
++Use absolute paths or paths starting with `~/`; spaces and special characters are supported. If a selected override is invalid, missing, unreadable, or cannot be decoded as an image, that display uses the current theme background. An invalid named override falls back directly to the theme, rather than the orientation default.
++
++Theme changes and background cycling continue to change the normal theme background. Overrides stay fixed, while theme colors still update throughout the desktop. Each display retains the normal aspect-preserving crop and reveal effect. Saving `shell.json` updates the settings without restarting the desktop; remove a setting to return to its usual fallback. With no `background` settings, behavior is unchanged.
+diff --git a/shell/plugins/background/Background.qml b/shell/plugins/background/Background.qml
+index 21e1b0a9807..9413dd770d3 100644
+--- a/shell/plugins/background/Background.qml
++++ b/shell/plugins/background/Background.qml
+@@ -6,10 +6,27 @@ import QtQuick.Effects
+ import QtQuick.Shapes
+ import qs.Commons
+ import qs.Ui
++import "Wallpaper.js" as Wallpaper
+ 
+ Item {
+   id: root
+ 
++  property var shell: null
++  readonly property var backgroundConfig: shell && shell.shellConfig ? shell.shellConfig.background : null
++  property var panels: []
++
++  // A fixed override may already be loaded when the theme transition ends.
++  // Check all displays, including ones whose Image.status did not change.
++  function finishTransition() {
++    if (!finishingTransition) return
++    for (var i = 0; i < panels.length; i++) {
++      if (!panels[i].baseReady) return
++    }
++    incomingBackground = ""
++    oldBackground = ""
++    finishingTransition = false
++  }
++
+   readonly property string home: Quickshell.env("HOME")
+   readonly property string stateHome: home + "/.local/state"
+   readonly property string currentBackgroundLink: stateHome + "/omarchy/current/background"
+@@ -171,6 +188,7 @@ Item {
+       if (root.incomingBackground) {
+         root.displayedBackground = root.currentBackground || root.incomingBackground
+         root.finishingTransition = true
++        Qt.callLater(root.finishTransition)
+       }
+       root.revealProgress = 1
+     }
+@@ -202,12 +220,24 @@ Item {
+       updatesEnabled: true
+ 
+       property bool maskReady: false
++      readonly property string overridePath: Wallpaper.select(root.backgroundConfig, modelData.name, width, height, root.home)
++      readonly property bool baseReady: base.status === Image.Ready || base.status === Image.Error
++
++      Component.onCompleted: {
++        root.panels = root.panels.concat([panel])
++        Qt.callLater(panel.maybeStartReveal)
++      }
++      Component.onDestruction: {
++        root.panels = root.panels.filter(function(candidate) { return candidate !== panel })
++        Qt.callLater(root.finishTransition)
++      }
++      onBaseReadyChanged: Qt.callLater(root.finishTransition)
+ 
+       function maybeStartReveal() {
+-        if (!root.incomingBackground || root.revealProgress !== 0 || maskReady) return
++        if (!root.incomingBackground || maskReady) return
+         if (incomingFrame.status !== Image.Ready) return
+         Qt.callLater(function() {
+-          if (!root.incomingBackground || root.revealProgress !== 0 || maskReady) return
++          if (!root.incomingBackground || maskReady) return
+           if (incomingFrame.status !== Image.Ready) return
+           root.startReveal(panel)
+         })
+@@ -218,26 +248,21 @@ Item {
+       WlrLayershell.keyboardFocus: WlrKeyboardFocus.None
+       exclusionMode: ExclusionMode.Ignore
+ 
+-      Image {
++      WallpaperImage {
+         id: base
+         anchors.fill: parent
+-        source: root.imageUrl(root.displayedBackground)
++        overrideSource: root.imageUrl(panel.overridePath)
++        fallbackSource: root.imageUrl(root.displayedBackground)
+         fillMode: Image.PreserveAspectCrop
+         asynchronous: true
+         cache: true
+-        onStatusChanged: {
+-          if (status === Image.Ready && root.finishingTransition) {
+-            root.incomingBackground = ""
+-            root.oldBackground = ""
+-            root.finishingTransition = false
+-          }
+-        }
+       }
+ 
+-      Image {
++      WallpaperImage {
+         id: oldFrame
+         anchors.fill: parent
+-        source: root.imageUrl(root.oldBackground)
++        overrideSource: root.imageUrl(panel.overridePath)
++        fallbackSource: root.imageUrl(root.oldBackground)
+         fillMode: Image.PreserveAspectCrop
+         asynchronous: true
+         cache: false
+@@ -260,10 +285,11 @@ Item {
+           maskSpreadAtMin: 0.02
+         }
+ 
+-        Image {
++        WallpaperImage {
+           id: incomingFrame
+           anchors.fill: parent
+-          source: root.imageUrl(root.incomingBackground)
++          overrideSource: root.imageUrl(panel.overridePath)
++          fallbackSource: root.imageUrl(root.incomingBackground)
+           fillMode: Image.PreserveAspectCrop
+           asynchronous: true
+           cache: false
+@@ -305,7 +331,7 @@ Item {
+         target: root
+         function onIncomingBackgroundChanged() {
+           panel.maskReady = false
+-          panel.maybeStartReveal()
++          Qt.callLater(panel.maybeStartReveal)
+         }
+       }
+ 
+diff --git a/shell/plugins/background/Wallpaper.js b/shell/plugins/background/Wallpaper.js
+new file mode 100644
+index 00000000000..00e0ea7e810
+--- /dev/null
++++ b/shell/plugins/background/Wallpaper.js
+@@ -0,0 +1,10 @@
++// Selection uses the surface's effective dimensions, after rotation and scaling.
++function select(config, name, width, height, home) {
++  if (!config || typeof config !== "object" || Array.isArray(config)) return ""
++  var monitors = config.monitors
++  var value = monitors && Object.prototype.hasOwnProperty.call(monitors, name)
++    ? monitors[name] : config[height > width ? "portrait" : "landscape"]
++  if (typeof value !== "string") return ""
++  if (value.indexOf("~/") === 0) value = home + value.slice(1)
++  return value.charAt(0) === "/" ? value : ""
++}
+diff --git a/shell/plugins/background/WallpaperImage.qml b/shell/plugins/background/WallpaperImage.qml
+new file mode 100644
+index 00000000000..26997aab431
+--- /dev/null
++++ b/shell/plugins/background/WallpaperImage.qml
+@@ -0,0 +1,18 @@
++import QtQuick
++
++Image {
++  id: root
++
++  property url overrideSource: ""
++  property url fallbackSource: ""
++  property url rejectedSource: ""
++
++  // Keep empty transition layers empty. Decode failures include missing and
++  // unreadable files, and must fall back to this layer's theme image.
++  source: fallbackSource.toString() ? (overrideSource.toString() && rejectedSource !== overrideSource ? overrideSource : fallbackSource) : ""
++  onOverrideSourceChanged: rejectedSource = ""
++  onStatusChanged: {
++    if (status === Image.Error && overrideSource.toString() && rejectedSource !== overrideSource)
++      rejectedSource = overrideSource
++  }
++}
+diff --git a/test/shell.d/background-test.sh b/test/shell.d/background-test.sh
+index 9762e6d3a2c..848658e1874 100644
+--- a/test/shell.d/background-test.sh
++++ b/test/shell.d/background-test.sh
+@@ -18,4 +18,13 @@ assert(
+     !backgroundQml.includes('pendingThemeVersion !== backgroundVersion'),
+   'background theme transition applies pending colors even if image reveal stalls'
+ )
++
++const wallpaper = {}
++require('vm').runInNewContext(fs.readFileSync(path.join(root, 'shell/plugins/background/Wallpaper.js'), 'utf8'), wallpaper)
++const config = {monitors: {'DP-1': '~/main.jpg'}, portrait: '/portrait.jpg', landscape: '/landscape.jpg'}
++assert(wallpaper.select(config, 'DP-1', 1080, 1920, '/home/test') === '/home/test/main.jpg', 'named wallpaper takes precedence and expands home')
++assert(wallpaper.select(config, 'DP-2', 1080, 1920, '') === '/portrait.jpg', 'vertical displays use the portrait default')
++assert(wallpaper.select(config, 'DP-2', 1920, 1080, '') === '/landscape.jpg', 'horizontal displays use the landscape default')
++assert(wallpaper.select({}, 'DP-1', 1920, 1080, '') === '', 'unconfigured displays use the theme wallpaper')
++assert(wallpaper.select({monitors: {'DP-1': 'relative.jpg'}}, 'DP-1', 1920, 1080, '') === '', 'invalid override paths use the theme wallpaper')
+ JS
