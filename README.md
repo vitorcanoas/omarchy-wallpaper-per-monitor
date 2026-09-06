@@ -31,6 +31,54 @@ omarchy plugin add https://github.com/vitorcanoas/omarchy-wallpaper-per-monitor.
 `omarchy-wallpaper-render` commands on `PATH`. It does not install the plugin
 or change your wallpaper by itself.
 
+## Removal
+
+```bash
+omarchy plugin remove vitorcanoas.background-per-monitor
+```
+
+That removes the plugin itself. If you also ran `install.sh`, undo it with
+the matching `./uninstall.sh` from the repository checkout:
+
+```bash
+./uninstall.sh
+```
+
+`uninstall.sh` reverses `install.sh` step by step:
+
+- removes the `wallpaper-monitor`, `wp` and `omarchy-wallpaper-render`
+  symlinks from `~/.local/bin` — but only if each one still points at this
+  plugin's installed `bin/` directory; a real file or a symlink to something
+  else at that path is left alone;
+- removes `vitorcanoas.background-per-monitor` from `plugins[]` in
+  `~/.config/omarchy/shell.json`, and restores `omarchy.background` by
+  removing it from `disabledPlugins[]`, backing up `shell.json` first;
+- removes the installed plugin directory,
+  `~/.config/omarchy/plugins/vitorcanoas.background-per-monitor/`.
+
+It does **not**:
+
+- delete `~/.config/omarchy/background-per-monitor.json`, your per-monitor
+  override config — that is your own configuration, not something the
+  installer created on your behalf, and it stays in place (the script prints
+  its path as a reminder);
+- delete `~/.config/omarchy/shell.json.bak.*` backups left behind by
+  `install.sh` — these accumulate across repeated installs and are removed
+  by hand (`rm -f ~/.config/omarchy/shell.json.bak.*`) once you no longer
+  need them;
+- restore `omarchy.background` if this installer's own plugin id was already
+  missing from `shell.json` when `uninstall.sh` ran (e.g. it was removed by
+  hand beforehand) — `shell.json` does not record which installer disabled
+  the native plugin, so `uninstall.sh` leaves `disabledPlugins[]` untouched
+  in that case rather than guess, and says so.
+
+As with `install.sh`, run `DRY_RUN=1 ./uninstall.sh` first to preview every
+step against a throwaway staging copy, with no changes to the real
+`shell.json` or `~/.local/bin`.
+
+Restart `omarchy-shell` (or your session) after either removal path for the
+change to take effect.
+
 ## Usage
 
 ### `wallpaper-monitor`
