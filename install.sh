@@ -373,10 +373,14 @@ add_menu_entry() {
   # guess if there is no closing brace to insert before -- appending after it
   # would produce a file the shell cannot parse, silently killing the user's
   # own menu extensions along with ours.
-  if ! grep -q '}' "$MENU_JSONC"; then
+  if ! awk '{ l = $0
+              sub(/\r$/, "", l); sub(/^\xef\xbb\xbf/, "", l)
+              gsub(/^[ \t]+|[ \t]+$/, "", l)
+              if (l == "{") { ok = 1; exit } }
+            END { exit !ok }' "$MENU_JSONC"; then
     cat >&2 <<MSG
-$MENU_JSONC has no closing "}" -- it does not look like the JSONC object this
-installer knows how to extend. Refusing to edit it.
+$MENU_JSONC has no line containing just the opening "{" -- it does not look
+like the JSONC object this installer knows how to extend. Refusing to edit it.
 
 Everything else was installed. To add the menu row by hand, put this line
 inside the top-level object of that file:
@@ -396,18 +400,33 @@ MSG
   # temp + mv, so a failure part-way through never leaves a truncated menu
   # file behind (an unparseable one costs the user their whole menu).
   TMP_MENU="$(mktemp)"
-  # awk, not sed: we insert before the LAST closing brace, which needs a
-  # one-pass buffer, and awk keeps every other line byte-identical.
+  # Insere logo APOS a "{" de abertura, nao antes da "}" final.
+  #
+  # Inserir no fim parece natural e esta errado: a linha cairia depois da
+  # ULTIMA entrada do usuario, que -- sendo a ultima -- nao termina em virgula.
+  # O arquivo vira JSON invalido, e o MenuModel.js faz JSON.parse dentro de um
+  # try/catch que devolve lista vazia: o usuario perde as PROPRIAS entradas do
+  # menu, sem nenhuma mensagem, e as nossas tambem nao aparecem. Havia mais
+  # armadilhas no mesmo caminho: "}" dentro de string ("action":"echo }"),
+  # array fechando no fim, comentario com "}" depois do fecho (a linha cairia
+  # FORA do objeto raiz).
+  #
+  # Depois da "{" nao ha nenhum desses casos: nossa linha ja termina em
+  # virgula, e virgula sobrando antes de "}" e legal em JSONC -- o stripJsonc
+  # do proprio Omarchy a remove.
   awk -v blk="$(menu_entry_block)" '
-    { lines[NR] = $0 }
-    /}/ { last = NR }
-    END {
-      for (i = 1; i <= NR; i++) {
-        if (i == last) print blk
-        print lines[i]
-      }
-    }
-  ' "$MENU_JSONC" >"$TMP_MENU"
+    !ins { l = $0
+           sub(/\r$/, "", l); sub(/^\xef\xbb\xbf/, "", l)
+           gsub(/^[ \t]+|[ \t]+$/, "", l)
+           if (l == "{") { print; print blk; ins = 1; next } }
+    { print }
+    END { if (!ins) exit 3 }
+  ' "$MENU_JSONC" >"$TMP_MENU" || {
+    rm -f "$TMP_MENU"; TMP_MENU=""
+    printf 'refused: %s has no standalone opening "{" -- left untouched\n' \
+      "$MENU_JSONC" >&2
+    return 0
+  }
   mv "$TMP_MENU" "$MENU_JSONC"
   TMP_MENU=""
   printf '==> added menu entry to %s\n' "$MENU_JSONC"

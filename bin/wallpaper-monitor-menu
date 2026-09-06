@@ -196,7 +196,15 @@ for m in monitores:
     if not isinstance(m, dict):
         continue
     nome = m.get("name")
-    if not nome:
+    if not isinstance(nome, str) or not nome:
+        continue
+    # Rejeitar AQUI, antes do print, e nao no bash depois: o formato de saida e
+    # TSV terminado em newline, entao um nome contendo \n ou \t vira DUAS linhas
+    # (ou uma linha com colunas a mais). A validacao do lado do bash roda sobre
+    # o fragmento JA quebrado -- e "DP" de um nome "DP\n1" passa na regex, por
+    # ser um nome perfeitamente valido. O resultado seria aplicar o wallpaper a
+    # um monitor fantasma, com rc=0 e sem aviso nenhum.
+    if any(c in nome for c in ("\n", "\t", "\r")):
         continue
     # Monitor desativado nao mostra nada; gravar override nele parece dar
     # certo e nao muda nada na tela.

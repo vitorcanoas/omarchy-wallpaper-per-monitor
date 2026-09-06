@@ -69,8 +69,17 @@ for k in ("portrait", "landscape"):
     if isinstance(v, str):
         p.append(v)
 for c in p:
-    r = os.path.dirname(os.path.dirname(c))
-    if os.path.isdir(r):
+    # Exigir que o pai seja 16x9/9x16 E que a raiz contenha um dos dois. Sem
+    # isso, um override apontando para uma imagem solta (~/Pictures/foto.png)
+    # elegeria ~/ como raiz do catalogo -- que existe, entao o teste passava --
+    # e o `wp h` voltaria a dizer "(sem 16x9)" com rc=0. O criterio precisa ser
+    # identico ao do wallpaper-monitor-menu: se os dois divergirem, o numero
+    # que o menu mostra e o que o `wp` aplica vem de catalogos diferentes.
+    d = os.path.dirname(c)
+    if os.path.basename(d) not in ("16x9", "9x16"):
+        continue
+    r = os.path.dirname(d)
+    if os.path.isdir(os.path.join(r, "16x9")) or os.path.isdir(os.path.join(r, "9x16")):
         print(r)
         break
 PYEOF
