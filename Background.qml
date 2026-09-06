@@ -20,8 +20,21 @@ Item {
   // oldBackground/incomingBackground vazavam para sempre.
   function finishTransition() {
     if (!finishingTransition) return
-    for (var i = 0; i < panels.length; i++) {
-      if (!panels[i].baseReady) return
+    // Compacta a lista ANTES de varrer. Se um monitor for desconectado durante
+    // a transicao, a entrada dele pode ficar aqui como objeto ja destruido --
+    // ler baseReady nele devolve undefined, e `!undefined` e true, o que fazia
+    // esta funcao retornar cedo PARA SEMPRE (nenhum evento futuro re-dispara,
+    // porque onBaseReadyChanged so existe em painel vivo). Resultado:
+    // incomingBackground/oldBackground nunca eram limpos e as Image de
+    // crossfade ficavam decodificadas em VRAM ate reiniciar o shell.
+    // Isto tambem e a rede de seguranca contra o lost-update entre o concat de
+    // Component.onCompleted e o filter de Component.onDestruction.
+    var alive = panels.filter(function(p) {
+      return p !== null && p !== undefined && p.baseReady !== undefined
+    })
+    if (alive.length !== panels.length) panels = alive
+    for (var i = 0; i < alive.length; i++) {
+      if (!alive[i].baseReady) return
     }
     incomingBackground = ""
     oldBackground = ""
@@ -53,12 +66,17 @@ Item {
   // Valida: so aceita caminho absoluto ou "~/..." (expandido para o home);
   // qualquer outra coisa retorna "" e cai no fallback.
   function selectOverride(config, name, width, height) {
-    if (!config || typeof config !== "object") return ""
+    if (!config || typeof config !== "object" || Array.isArray(config)) return ""
     var monitors = config.monitors
     var isNewFormat = monitors && typeof monitors === "object"
     var map = isNewFormat ? monitors : config
     var value = Object.prototype.hasOwnProperty.call(map, name) ? map[name] : undefined
-    if (value === undefined && isNewFormat) {
+    // O fallback por orientacao vale para os DOIS formatos. No formato antigo
+    // e plano ({"DP-2": "...", "portrait": "..."}) as chaves de orientacao
+    // convivem com os nomes de monitor no mesmo objeto; antes o fallback so
+    // rodava com "monitors" presente, e um JSON antigo com "portrait" era
+    // ignorado em silencio, contrariando a precedencia prometida acima.
+    if (value === undefined) {
       value = config[height > width ? "portrait" : "landscape"]
     }
     if (typeof value !== "string") return ""
@@ -322,6 +340,14 @@ Item {
         Qt.callLater(panel.maybeStartReveal)
       }
       Component.onDestruction: {
+        // Este filter e o concat de Component.onCompleted sao ambos
+        // read-modify-write sobre root.panels: num dock/undock com dois
+        // monitores no mesmo tick, o concat pode sobrescrever o filter e
+        // devolver um painel morto a lista. Isso e TOLERADO de proposito --
+        // root.finishTransition() compacta a lista descartando entradas
+        // destruidas antes de varre-la, e essa compactacao e a rede de
+        // seguranca. Nao "otimize" a compactacao de la achando que este
+        // filter ja basta: ele nao basta.
         root.panels = root.panels.filter(function(candidate) { return candidate !== panel })
         Qt.callLater(root.finishTransition)
       }
@@ -363,6 +389,26 @@ Item {
       readonly property bool useOverride: panel.overridePath !== "" && panel.rejectedOverridePath !== panel.overridePath
       readonly property string baseSource: panel.useOverride ? panel.overridePath : root.displayedBackground
 
+      // Sinal de validacao do plugin, e o unico confiavel: o log de
+      // onOverridePathChanged dispara DURANTE a mudanca de overridePath, antes
+      // de useOverride reavaliar em cadeia, entao la ele ainda le o valor
+      // anterior (tipicamente false no primeiro frame) -- o que ja levou a um
+      // falso alarme de regressao. Aqui o valor e' o definitivo.
+      //   journalctl --user -t omarchy-shell | grep useOverride=
+      onUseOverrideChanged: console.debug("vitorcanoas.background: screen=" + modelData.name +
+        " useOverride=" + panel.useOverride +
+        " source=[" + panel.baseSource + "]")
+
+      // Tamanho de decodificacao quantizado pela TELA, nao pela janela. A
+      // geometria da janela muda em rotacao/hotplug, e o QQuickPixmapCache
+      // trata (url, sourceSize) como chave distinta: amarrar sourceSize a
+      // width/height forcava um re-decode completo da imagem (PNG de 8000px,
+      // ~144MB transitorios) a cada mudanca de geometria. modelData e o
+      // ShellScreen e ja reporta dimensoes POS-rotacao (HDMI-A-1 chega como
+      // 1080x1920 em retrato), entao o valor continua correto.
+      readonly property int decodeWidth: modelData.width > 0 ? modelData.width : width
+      readonly property int decodeHeight: modelData.height > 0 ? modelData.height : height
+
       Image {
         id: base
         anchors.fill: parent
@@ -374,8 +420,8 @@ Item {
         // tem PNG de ate 14MB / 8000px de largura) -- decodifica so no
         // tamanho que sera exibido. PreserveAspectCrop continua funcionando
         // normalmente com sourceSize definido.
-        sourceSize.width: width
-        sourceSize.height: height
+        sourceSize.width: panel.decodeWidth
+        sourceSize.height: panel.decodeHeight
         onStatusChanged: {
           if (status === Image.Error && panel.useOverride) {
             // Bad override path -- fall back to the normal symlink background,
@@ -392,17 +438,47 @@ Item {
         }
       }
 
+      // Camadas de crossfade. Duas correcoes de VRAM aqui:
+      //
+      // 1. `visible: false` impede RENDERIZAR, nao CARREGAR -- uma Image com
+      //    source valido decodifica de qualquer jeito. Com useOverride ligado
+      //    (o caso desta maquina, as duas telas em override) isso eram quatro
+      //    decodes full-res por troca de tema que nenhum pixel exibia. Zerar a
+      //    source e o unico jeito de nao pagar por elas.
+      //    Efeito colateral esperado e SEGURO: com source vazia o status vira
+      //    Image.Null, maybeStartReveal() nunca ve Image.Ready e startReveal()
+      //    -- logo applyPendingTheme() -- nao roda por este caminho. O tema
+      //    ainda aplica porque setPendingTheme() arma pendingThemeFallbackTimer
+      //    (300ms) e onTriggered chama applyPendingTheme() incondicionalmente.
+      //    Com as duas telas em override esse timer JA e hoje o unico caminho
+      //    que aplica o tema, entao isto nao muda o comportamento em producao.
+      //
+      // 2. sourceSize evita decodificar em resolucao nativa (~192MB por camada
+      //    com os PNG grandes do catalogo). Com sourceSize definido nao ha
+      //    minificacao a filtrar, entao mipmap perde proposito e so custa ~33%
+      //    de memoria extra de textura -- removido; smooth continua.
       Image {
         id: oldFrame
         anchors.fill: parent
-        source: root.imageUrl(root.oldBackground)
+        source: panel.useOverride ? "" : root.imageUrl(root.oldBackground)
         fillMode: Image.PreserveAspectCrop
         asynchronous: true
         cache: false
         smooth: true
-        mipmap: true
+        sourceSize.width: panel.decodeWidth
+        sourceSize.height: panel.decodeHeight
         visible: !panel.useOverride && root.oldBackground !== "" && root.revealProgress < 1
-        onStatusChanged: panel.maybeStartReveal()
+        onStatusChanged: {
+          if (status === Image.Error) {
+            // Arquivo do tema sumiu no meio da transicao. Sem isto o reveal
+            // aborta calado: revealProgress trava em 0 e a tela congela no
+            // wallpaper ANTIGO ja com as cores novas. Destrava o crossfade.
+            console.warn("vitorcanoas.background: oldFrame failed to load [" +
+              root.oldBackground + "] on screen " + modelData.name + " -- unblocking reveal")
+            root.revealProgress = 1
+          }
+          panel.maybeStartReveal()
+        }
       }
 
       Item {
@@ -421,13 +497,21 @@ Item {
         Image {
           id: incomingFrame
           anchors.fill: parent
-          source: root.imageUrl(root.incomingBackground)
+          source: panel.useOverride ? "" : root.imageUrl(root.incomingBackground)
           fillMode: Image.PreserveAspectCrop
           asynchronous: true
           cache: false
           smooth: true
-          mipmap: true
-          onStatusChanged: panel.maybeStartReveal()
+          sourceSize.width: panel.decodeWidth
+          sourceSize.height: panel.decodeHeight
+          onStatusChanged: {
+            if (status === Image.Error) {
+              console.warn("vitorcanoas.background: incomingFrame failed to load [" +
+                root.incomingBackground + "] on screen " + modelData.name + " -- unblocking reveal")
+              root.revealProgress = 1
+            }
+            panel.maybeStartReveal()
+          }
         }
       }
 
@@ -470,14 +554,27 @@ Item {
       // A fresh override path (new JSON content, or the file being cleared)
       // always gets a fresh load attempt.
       onOverridePathChanged: {
+        // Loga o estado ANTES do reset. O log estava dentro de um Qt.callLater
+        // que so rodava depois desta atribuicao -- e, sendo coalescido por
+        // evento, num hotplug imprimia sempre rejectedOverridePath=[] mesmo
+        // quando um override tinha acabado de falhar, escondendo justamente a
+        // informacao que se queria diagnosticar.
+        console.debug("vitorcanoas.background: screen=" + modelData.name +
+          " overridePath=[" + panel.overridePath + "]" +
+          " rejectedOverridePath(before reset)=[" + panel.rejectedOverridePath + "]" +
+          // useOverride e' o sinal que se usa para validar o plugin em producao
+          // (`journalctl --user -t omarchy-shell | grep useOverride`). Lido aqui,
+          // antes do reset abaixo, ele e' coerente com o rejectedOverridePath da
+          // mesma linha -- os dois descrevem o mesmo instante.
+          " useOverride=" + panel.useOverride +
+          // width/height sao os da JANELA e no primeiro frame ainda valem 500x500
+          // (pre-layout); screen= e' a geometria efetiva pos-rotacao, que e' a que
+          // decide orientacao e o sourceSize de decodificacao.
+          " width=" + width + " height=" + height +
+          " screen=" + panel.decodeWidth + "x" + panel.decodeHeight)
+        // Load-bearing: um caminho de override novo (JSON alterado, ou arquivo
+        // limpo) sempre merece uma tentativa de carga limpa.
         panel.rejectedOverridePath = ""
-        Qt.callLater(function() {
-          console.debug("vitorcanoas.background: screen=" + modelData.name +
-            " overridePath=[" + panel.overridePath + "]" +
-            " rejectedOverridePath=[" + panel.rejectedOverridePath + "]" +
-            " useOverride=" + panel.useOverride +
-            " width=" + width + " height=" + height)
-        })
       }
 
       MouseArea {

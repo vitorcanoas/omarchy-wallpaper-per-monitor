@@ -22,13 +22,17 @@
 #
 #     DRY_RUN=1 ./install.sh
 #
-# To undo a real install:
+# To undo a real install, run ./uninstall.sh (mirrors this script's safety
+# rules: $HOME-explicit, DRY_RUN=1 to preview, idempotent). It does not
+# touch ~/.config/omarchy/shell.json.bak.* -- see below.
 #
-#     rm -rf ~/.config/omarchy/plugins/vitorcanoas.background-per-monitor
-#     rm -f ~/.local/bin/wallpaper-monitor ~/.local/bin/wp ~/.local/bin/omarchy-wallpaper-render
-#     # then edit shell.json by hand: drop "vitorcanoas.background-per-monitor"
-#     # from plugins[], and drop "omarchy.background" from disabledPlugins[]
-#     # if you want the native background plugin back.
+# Every real (non-DRY_RUN) run that finds an existing shell.json backs it up
+# first as shell.json.bak.<timestamp>, and these backups are NOT rotated or
+# cleaned up automatically, by this script or by uninstall.sh -- they
+# accumulate in ~/.config/omarchy/ across repeated installs. Remove old ones
+# by hand once you no longer need them:
+#
+#     rm -f ~/.config/omarchy/shell.json.bak.*
 
 set -euo pipefail
 
@@ -38,6 +42,13 @@ PLUGIN_ID="vitorcanoas.background-per-monitor"
 NATIVE_PLUGIN_ID="omarchy.background"
 
 DRY_RUN="${DRY_RUN:-0}"
+case "$DRY_RUN" in
+  0|1) ;;
+  *)
+    printf 'DRY_RUN must be 0 or 1 (got %q). Refusing to guess -- e.g. "true" is\nnot 1 and would otherwise silently run a REAL install.\n' "$DRY_RUN" >&2
+    exit 1
+    ;;
+esac
 
 ## Deliberately NOT honoring XDG_CONFIG_HOME/XDG_BIN_HOME here: Omarchy's own
 ## migrations always resolve shell.json as "$HOME/.config/omarchy/shell.json"
@@ -52,9 +63,19 @@ DRY_RUN="${DRY_RUN:-0}"
 OMARCHY_CONFIG_DIR="$HOME/.config/omarchy"
 BIN_DIR="$HOME/.local/bin"
 
+# Single cleanup trap for the whole script (DRY_RUN staging dir and/or the
+# real-path TMP_JSON below) -- a second `trap ... EXIT` would silently
+# replace this one rather than stack, so anything that needs cleanup on exit
+# must be added to this same function instead of calling `trap` again.
+cleanup() {
+  [[ -n "${STAGE:-}" ]] && rm -rf "$STAGE"
+  [[ -n "${TMP_JSON:-}" ]] && rm -f "$TMP_JSON"
+  return 0
+}
+trap cleanup EXIT
+
 if [[ $DRY_RUN == 1 ]]; then
   STAGE="$(mktemp -d)"
-  trap 'rm -rf "$STAGE"' EXIT
   PLUGIN_DIR="$STAGE/plugins/$PLUGIN_ID"
   SHELL_JSON="$STAGE/shell.json"
   mkdir -p "$STAGE/plugins" "$(dirname "$BIN_DIR")"
@@ -78,6 +99,17 @@ if ! command -v jq >/dev/null 2>&1; then
 jq is required to edit shell.json safely and was not found.
 
     yay -S jq
+
+MSG
+  exit 1
+fi
+
+if ! command -v omarchy >/dev/null 2>&1; then
+  cat >&2 <<'MSG'
+omarchy was not found on PATH. This installer registers a plugin in
+~/.config/omarchy/shell.json for Omarchy's Quickshell to load -- without
+Omarchy actually installed, that file being created/edited would look like a
+successful install while there is no shell around to ever load the plugin.
 
 MSG
   exit 1
@@ -108,12 +140,58 @@ rsync -a --delete \
   "$HERE"/ "$PLUGIN_DIR"/
 chmod +x "$PLUGIN_DIR/bin/wallpaper-monitor" "$PLUGIN_DIR/bin/wp" "$PLUGIN_DIR/bin/omarchy-wallpaper-render"
 
+# --- 1b. Pre-flight check that all 3 symlinks CAN be created ---------------
+#
+# Deliberately done before touching shell.json (step 2&3 below). shell.json
+# edits and symlink creation are not one atomic transaction, and jq/mv on
+# shell.json has no rollback -- so if a later link_one call died (e.g. an
+# unrelated ~/.local/bin/wp from another tool), the user would be left with
+# shell.json already pointing at this plugin and the native background
+# already disabled, but the CLI not actually reachable, with an error message
+# that never mentions shell.json was touched. Running a side-effect-free dry
+# pass over all 3 links first means the real work in step 4 either succeeds
+# for all of them or step 2&3 never runs at all.
+check_link_one() {
+  local name=$1
+  local target="$PLUGIN_DIR/bin/$name"
+  local link="$BIN_DIR/$name"
+
+  if [[ -e $link || -L $link ]]; then
+    # Our own symlink (live or dangling) is fine -- link_one in step 4 will
+    # either skip it (already correct) or replace it (dangling/stale).
+    if [[ -L $link ]]; then
+      return 0
+    fi
+
+    cat >&2 <<MSG
+$link already exists and is not this plugin's symlink.
+
+Refusing to install. Nothing has been changed yet -- shell.json and the
+plugin's other symlinks are untouched. Move $link aside first, or skip the
+symlink step and call the plugin's bin/ directly:
+
+    $target
+
+MSG
+    exit 1
+  fi
+}
+
+mkdir -p "$BIN_DIR"
+check_link_one wallpaper-monitor
+check_link_one wp
+check_link_one omarchy-wallpaper-render
+
 # --- 2 & 3. Register the plugin and disable the native one ----------------
 #
 # Back up shell.json before touching it -- it is hand-edited, human-owned
 # config, not something regenerated on demand.
 if [[ -f $SHELL_JSON ]]; then
-  BACKUP="$SHELL_JSON.bak.$(date +%Y%m%d-%H%M%S)"
+  # %N (nanoseconds, GNU date) rather than second resolution: two installs
+  # run back-to-back (e.g. testing idempotency, or a script driving this)
+  # can land in the same second, and second-resolution backups would then
+  # silently clobber each other -- losing the backup of the ORIGINAL state.
+  BACKUP="$SHELL_JSON.bak.$(date +%Y%m%d-%H%M%S-%N)"
   cp "$SHELL_JSON" "$BACKUP"
   printf '==> backed up %s -> %s\n' "$SHELL_JSON" "$BACKUP"
 else
@@ -143,8 +221,10 @@ mv "$TMP_JSON" "$SHELL_JSON"
 printf '==> registered %s and disabled %s in %s\n' "$PLUGIN_ID" "$NATIVE_PLUGIN_ID" "$SHELL_JSON"
 
 # --- 4. Symlink the CLIs into ~/.local/bin ---------------------------------
-mkdir -p "$BIN_DIR"
-
+# BIN_DIR was already created during the pre-flight check above; the check
+# already ruled out any foreign (non-symlink) file at each of these 3 paths,
+# so the only things link_one can still find here are: nothing, our own live
+# symlink, or our own dangling symlink -- all handled below.
 link_one() {
   local name=$1
   local target="$PLUGIN_DIR/bin/$name"

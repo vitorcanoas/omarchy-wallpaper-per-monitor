@@ -28,13 +28,20 @@
 # Script relocavel: nada de caminho absoluto chumbado. Base derivada de
 # $(dirname "$0")/..
 
-set -uo pipefail
+set -euo pipefail
 
 BASE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SRC="$BASE"
 OUT="$SRC/render"
 DISCARD="$OUT/_descartados-v2"
 WORK="${TMPDIR:-/tmp}/wprender-v3.$$"
+# O default abaixo e' o caminho do pacote realesrgan-ncnn-vulkan no Arch
+# (AUR). Em Debian/Fedora o binario normalmente vem direto do release do
+# GitHub (github.com/xinntao/Real-ESRGAN-ncnn-vulkan), que empacota
+# models/ ao lado do proprio executavel, nao em /usr/share -- nesse caso
+# exporte REALESRGAN_MODELS apontando para essa pasta antes de rodar este
+# script. Esta env var e' a UNICA forma de sobrepor o caminho (nao ha flag
+# de linha de comando para isso).
 MODELS="${REALESRGAN_MODELS:-/usr/share/realesrgan-ncnn-vulkan/models}"
 MODEL="realesrgan-x4plus-anime"
 MAGICK="magick"
@@ -44,13 +51,44 @@ command -v "$MAGICK" >/dev/null 2>&1 || { echo "erro: ImageMagick nao encontrado
 command -v realesrgan-ncnn-vulkan >/dev/null 2>&1 || { echo "erro: realesrgan-ncnn-vulkan nao encontrado" >&2; exit 1; }
 [ -d "$MODELS" ] || { echo "erro: modelos nao encontrados em $MODELS" >&2; exit 1; }
 
-mkdir -p "$OUT/16x9" "$OUT/9x16" "$DISCARD" "$WORK"
+mkdir -p "$OUT/16x9" "$OUT/9x16" "$DISCARD" "$WORK" || {
+  echo "erro: nao foi possivel criar os diretorios de saida sob $OUT (permissao? $SRC read-only?)" >&2
+  exit 1
+}
+
+# Duas instancias rodando ao mesmo tempo sobre o mesmo $OUT tem uma race
+# real: $WORK e' isolado por $$ (uma instancia nao pisa no WORK da outra),
+# mas $OUT e $DISCARD sao compartilhados -- limpa_orfaos_v2 faz `mv -f` de
+# um orfao enquanto a outra instancia pode estar gravando o mesmo nome de
+# arquivo em $OUT/$target (render_bleed escreve DIRETO no destino final, sem
+# temp+rename), e um wallpaper recem-renderizado pode "sumir" para
+# _descartados-v2/. flock e' util-linux, presente em Arch/Debian/Fedora --
+# o script ja e' Linux-especifico (realesrgan-ncnn-vulkan, /usr/share/...).
+# Reexecuta a si mesmo sob flock uma unica vez (guardado por FLOCKED=1) para
+# serializar instancias concorrentes em vez de deixa-las correr em paralelo.
+if [ "${FLOCKED:-0}" != 1 ]; then
+  exec env FLOCKED=1 flock "$OUT/.render.lock" "$0" "$@"
+fi
+
 trap 'rm -rf "$WORK"' EXIT
 
 log()  { printf '%s\n' "$*" >&2; }
 warn() { printf '\n!!!!!! AVISO: %s !!!!!!\n\n' "$*" >&2; }
 w_of() { $MAGICK identify -format '%w' "$1"; }
 h_of() { $MAGICK identify -format '%h' "$1"; }
+
+# check_dims <path> <w> <h> -- valida que identify devolveu numeros de fato.
+# Um arquivo invalido (ex.: HTML de erro 404 salvo com extensao .jpg, ou PNG
+# truncado) faz `identify` falhar ou devolver string vazia; sem checagem isso
+# propaga ate uma conta em awk (divisao por zero) rio abaixo, e o aviso final
+# dizia so' "aspecto (vazio) longe do alvo" em vez de apontar a causa real.
+check_dims() {
+  local path=$1 w=$2 h=$3
+  if [ -z "$w" ] || [ -z "$h" ]; then
+    log "erro: nao foi possivel ler as dimensoes de $path -- arquivo corrompido, truncado ou nao e' uma imagem valida"
+    return 1
+  fi
+}
 
 # ---------------------------------------------------------------------------
 # upscale <in> <out> <needW> <needH>  -- reaproveitada da v2, intocada.
@@ -61,11 +99,26 @@ h_of() { $MAGICK identify -format '%h' "$1"; }
 upscale() {
   local in=$1 out=$2 needW=$3 needH=$4
   local w h fx fy f cur n i
-  w=$(w_of "$in"); h=$(h_of "$in")
+  # `|| true` aqui e' esperado: identify pode legitimamente falhar num
+  # arquivo de origem invalido, e a checagem explicita logo abaixo (nao o
+  # exit code) e' quem decide se aborta esta chamada -- ver check_dims.
+  w=$(w_of "$in" || true); h=$(h_of "$in" || true)
+  check_dims "$in" "$w" "$h" || return 1
   fx=$(awk -v a="$needW" -v b="$w" 'BEGIN{print a/b}')
   fy=$(awk -v a="$needH" -v b="$h" 'BEGIN{print a/b}')
   f=$(awk -v a="$fx" -v b="$fy" 'BEGIN{print (a>b)?a:b}')
-  n=$(awk -v f="$f" 'BEGIN{ if (f<=1.02) print 0; else { p=0; c=1; while (c<f && p<2) { c*=4; p++ } print p } }')
+  # p<3 (nao p<2): com p<2 um fator de ~4.01x forcava DUAS passadas inteiras
+  # de Real-ESRGAN (dezenas de segundos/minutos de GPU cada) so' para cobrir
+  # 0.02x que uma passada + Lanczos ja resolvia -- e um fator de ~17x parava
+  # em p=2 (c=16) sem NUNCA cobrir f, entregando saida menor que o pedido
+  # (o resize final via Lanczos completava em silencio, diluindo o ganho do
+  # Real-ESRGAN). f-1e-9 evita 1 passada extra por erro de arredondamento
+  # de ponto flutuante quando f cai bem em cima de uma potencia de 4.
+  n=$(awk -v f="$f" 'BEGIN{ if (f<=1.02) print 0; else { p=0; c=1; while (c<f-1e-9 && p<3) { c*=4; p++ } print p } }')
+  if [ "$n" != "0" ]; then
+    local covers; covers=$(awk -v f="$f" -v p="$n" 'BEGIN{print (4^p >= f-1e-9) ? 1 : 0}')
+    [ "$covers" = "0" ] && warn "$(basename "$in"): fator de upscale $f muito alto, $n passadas de Real-ESRGAN so' cobrem $((4**n))x -- o resize final via Lanczos vai completar o restante (perda de nitidez em upscales extremos)."
+  fi
   if [ "$n" = "0" ]; then
     cp "$in" "$out"
     return
@@ -74,11 +127,18 @@ upscale() {
   for ((i=1; i<=n; i++)); do
     local step="$WORK/up.$$.$i.png"
     log "      real-esrgan x4 (passada $i/$n) $(basename "$in")"
-    if realesrgan-ncnn-vulkan -i "$cur" -o "$step" -n "$MODEL" -m "$MODELS" -s 4 -f png >/dev/null 2>&1; then
+    # Exit code alone is not trustworthy here: driver Vulkan travando por
+    # falta de VRAM, ou o processo sendo morto por OOM, pode deixar $step
+    # vazio (ou ausente) e AINDA ASSIM sair com exit 0 em certos builds
+    # ncnn-vulkan com driver AMD/Mesa. `[ -s "$step" ]` (arquivo existe E
+    # tem tamanho > 0) e' a checagem real de sucesso.
+    if realesrgan-ncnn-vulkan -i "$cur" -o "$step" -n "$MODEL" -m "$MODELS" -s 4 -f png >/dev/null 2>&1 \
+       && [ -s "$step" ]; then
       [ "$cur" != "$in" ] && rm -f "$cur"
       cur="$step"
     else
-      log "      !! esrgan falhou, mantendo o que tem e completando com Lanczos"
+      log "      !! esrgan falhou ou produziu arquivo vazio/invalido, mantendo o que tem e completando com Lanczos"
+      rm -f "$step"
       break
     fi
   done
@@ -115,7 +175,8 @@ render_flat() {
   fi
   $MAGICK "$p" -bordercolor "$bg" -border 1 -fuzz 8% -trim +repage "$c"
 
-  local cw ch; cw=$(w_of "$c"); ch=$(h_of "$c")
+  local cw ch; cw=$(w_of "$c" || true); ch=$(h_of "$c" || true)
+  check_dims "$c" "$cw" "$ch" || { log "AVISO: $base -- pulando ($target)"; return; }
   log "   [flat] $base -> $target  motivo ${cw}x${ch} sobre $bg  fill=$fill"
 
   local W H; [ "$target" = "16x9" ] && { W=1920; H=1080; } || { W=1080; H=1920; }
@@ -155,7 +216,8 @@ render_bleed() {
     cp "$src" "$p"
   fi
 
-  local sw sh sa; sw=$(w_of "$p"); sh=$(h_of "$p")
+  local sw sh sa; sw=$(w_of "$p" || true); sh=$(h_of "$p" || true)
+  check_dims "$p" "$sw" "$sh" || { log "AVISO: $base -- pulando ($target)"; return; }
   sa=$(awk -v w="$sw" -v h="$sh" 'BEGIN{print w/h}')
 
   local W H ta; [ "$target" = "16x9" ] && { W=1920; H=1080; } || { W=1080; H=1920; }
@@ -262,3 +324,13 @@ log ""
 log "=== PRONTO ==="
 ls -1 "$OUT/16x9" | wc -l | xargs echo "16x9:"
 ls -1 "$OUT/9x16" | wc -l | xargs echo "9x16:"
+
+# `ls | wc -l` conta qualquer arquivo presente, inclusive um PNG truncado
+# (ex.: composicao interrompida no meio por disco cheio) -- avisa
+# separadamente sobre qualquer saida suspeitosamente pequena (<1KB), o que
+# nenhum wallpaper renderizado de verdade deveria ser.
+suspicious=$(find "$OUT/16x9" "$OUT/9x16" -maxdepth 1 -name '*.png' -size -1k 2>/dev/null || true)
+if [ -n "$suspicious" ]; then
+  warn "arquivo(s) suspeitosamente pequenos (<1KB), possivel saida truncada/corrompida:
+$suspicious"
+fi

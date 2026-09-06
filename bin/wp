@@ -3,13 +3,28 @@
 #   wp                 lista os dois catalogos
 #   wp h 12            aplica a 12a arte deitada no monitor horizontal
 #   wp v 3             aplica a 3a arte em pe no monitor vertical
+#   wp h 12 DP-3       aplica no monitor DP-3 (quando ha mais de um horizontal)
 #   wp h               so lista as deitadas
 # Descobre o monitor pela orientacao real (hyprctl), nao por nome chumbado.
 set -uo pipefail
+
+# LC_ALL=C fixa a ordem do catalogo. Sem isso o glob segue LC_COLLATE, que muda
+# entre um terminal interativo e um keybind/systemd -- o mesmo `wp h 5` pegava
+# artes diferentes conforme de onde era chamado (art-10 antes ou depois de
+# art-2). A numeracao que o usuario memoriza precisa ser estavel.
+export LC_ALL=C
+
 SELF="$(readlink -f "${BASH_SOURCE[0]}")"
 BASE="$(cd "$(dirname "$SELF")/.." && pwd)"
 R="$BASE/render"
 CLI="$(dirname "$SELF")/wallpaper-monitor"
+
+# Nomes de monitor aceitos. O pipeline abaixo (print -> grep -c -> head -n1) e
+# delimitado por newline, entao um nome contendo \n seria truncado no meio e o
+# override iria para um monitor que nao existe. Validar o formato e mais
+# simples que trocar todo o pipeline para NUL, e nomes de conector reais
+# (DP-2, HDMI-A-1, eDP-1, desc:...) cabem folgadamente aqui.
+MONITOR_RE='^[A-Za-z0-9._:-]+$'
 
 mon_por_orientacao() {  # $1 = portrait|landscape
   command -v hyprctl >/dev/null 2>&1 || { echo "erro: hyprctl nao encontrado (sem Hyprland rodando?)" >&2; return 1; }
@@ -21,43 +36,123 @@ alvo = sys.argv[1]
 raw = sys.stdin.read()
 if not raw.strip():
     sys.exit(0)
-for m in json.loads(raw):
+try:
+    monitores = json.loads(raw)
+except ValueError:
+    sys.exit(1)
+if not isinstance(monitores, list):
+    sys.exit(1)
+for m in monitores:
+    if not isinstance(m, dict):
+        continue
+    nome = m.get('name')
+    if not nome:
+        # Monitor sem nome nao da para enderecar; ignorar em silencio e melhor
+        # que estourar um traceback que a mensagem de erro final atribuiria ao
+        # hyprctl.
+        continue
+    # Um monitor desativado nao mostra nada; gravar override nele parecia dar
+    # certo e nao mudava nada na tela.
+    if m.get('disabled'):
+        continue
+    w = m.get('width')
+    h = m.get('height')
+    if not isinstance(w, int) or not isinstance(h, int):
+        continue
+    t = m.get('transform', 0)
+    if not isinstance(t, int):
+        t = 0
     # transform impar = rotacionado, entao inverte w/h para a geometria logica
-    w, h = (m['height'], m['width']) if m['transform'] % 2 else (m['width'], m['height'])
+    w, h = (h, w) if t % 2 else (w, h)
     if (h > w and alvo == 'portrait') or (w >= h and alvo == 'landscape'):
-        print(m['name'])
-" "$1")"
+        print(nome)
+" "$1")" || return 1
   if [ -z "$candidatos" ]; then
     return 1
   fi
   local n; n=$(printf '%s\n' "$candidatos" | grep -c .)
   if [ "$n" -gt 1 ]; then
     echo "aviso: mais de um monitor $1 detectado ($(printf '%s' "$candidatos" | tr '\n' ' ')); usando o primeiro" >&2
+    echo "       para escolher outro, passe o nome: wp <h|v> <n> <MONITOR>" >&2
   fi
   printf '%s\n' "$candidatos" | head -n1
 }
 
+# Confere que o monitor pedido pelo nome existe, esta ativo e tem a orientacao
+# esperada. Sem isso, `wp h 5 DP-9` gravaria override para um monitor
+# inexistente sem reclamar.
+valida_monitor() {  # $1 = nome, $2 = portrait|landscape
+  local nome="$1" alvo="$2"
+  command -v hyprctl >/dev/null 2>&1 || { echo "erro: hyprctl nao encontrado (sem Hyprland rodando?)" >&2; return 1; }
+  hyprctl monitors -j | python3 -c "
+import sys, json
+
+nome, alvo = sys.argv[1], sys.argv[2]
+raw = sys.stdin.read()
+if not raw.strip():
+    sys.exit(1)
+try:
+    monitores = json.loads(raw)
+except ValueError:
+    sys.exit(1)
+if not isinstance(monitores, list):
+    sys.exit(1)
+
+for m in monitores:
+    if not isinstance(m, dict) or m.get('name') != nome:
+        continue
+    if m.get('disabled'):
+        print(f'erro: monitor {nome} esta desativado', file=sys.stderr)
+        sys.exit(1)
+    w = m.get('width')
+    h = m.get('height')
+    if not isinstance(w, int) or not isinstance(h, int):
+        # Sem dimensoes nao da para conferir a orientacao; aceita, ja que o
+        # usuario nomeou o monitor explicitamente.
+        sys.exit(0)
+    t = m.get('transform', 0)
+    if not isinstance(t, int):
+        t = 0
+    w, h = (h, w) if t % 2 else (w, h)
+    real = 'portrait' if h > w else 'landscape'
+    if real != alvo:
+        print(f'erro: monitor {nome} e {real}, nao {alvo}', file=sys.stderr)
+        sys.exit(1)
+    sys.exit(0)
+
+print(f'erro: monitor {nome} nao encontrado em hyprctl monitors', file=sys.stderr)
+sys.exit(1)
+" "$nome" "$alvo"
+}
+
 lista() { # $1 = pasta, $2 = rotulo
   local d="$R/$1" i=1 f
-  [ -d "$d" ] || { echo "  (sem $1)"; return; }
+  [ -d "$d" ] || { echo "  (sem $1)"; return 0; }
   echo "== $2 =="
-  for f in "$d"/*.png; do
-    [ -e "$f" ] || continue
+  local a=()
+  shopt -s nullglob
+  a=("$d"/*.png)
+  shopt -u nullglob
+  for f in "${a[@]}"; do
     printf "  %2d. %s\n" "$i" "$(basename "${f%.png}")"
     i=$((i+1))
   done
+  return 0
 }
 
-aplica() { # $1 = 16x9|9x16, $2 = indice, $3 = portrait|landscape
-  local d="$R/$1" n="$2"
+aplica() { # $1 = 16x9|9x16, $2 = indice, $3 = portrait|landscape, $4 = monitor (opcional)
+  local d="$R/$1" n="$2" alvo="$3" mon_pedido="${4:-}"
 
   if [[ ! "$n" =~ ^[0-9]+$ ]]; then
     echo "erro: numero invalido: '$n' (use um inteiro simples, sem virgula/intervalo)" >&2
-    exit 1
+    return 1
   fi
-  if [ "$n" -lt 1 ] 2>/dev/null; then
+  # Base 10 explicita: sem isso `wp h 09` estoura "value too great for base"
+  # dentro do (( )), porque um zero a esquerda faz bash ler o numero como octal.
+  n=$((10#$n))
+  if (( n < 1 )); then
     echo "erro: numero $n fora de faixa (minimo 1)" >&2
-    exit 1
+    return 1
   fi
 
   local a=()
@@ -65,21 +160,87 @@ aplica() { # $1 = 16x9|9x16, $2 = indice, $3 = portrait|landscape
   a=("$d"/*.png)
   shopt -u nullglob
 
-  if (( n < 1 || n > ${#a[@]} )); then
+  if (( ${#a[@]} == 0 )); then
+    echo "erro: nenhuma arte encontrada em $d" >&2
+    return 1
+  fi
+  if (( n > ${#a[@]} )); then
     echo "erro: numero $n fora de 1..${#a[@]}" >&2
-    exit 1
+    return 1
   fi
   local f="${a[n-1]}"
 
-  local mon; mon=$(mon_por_orientacao "$3") || { echo "erro: nao foi possivel detectar monitor $3 (verifique hyprctl)" >&2; exit 1; }
-  [ -z "$mon" ] && { echo "erro: nenhum monitor $3 detectado" >&2; exit 1; }
+  local mon
+  if [ -n "$mon_pedido" ]; then
+    if [[ ! "$mon_pedido" =~ $MONITOR_RE ]]; then
+      echo "erro: nome de monitor invalido: '$mon_pedido'" >&2
+      return 1
+    fi
+    valida_monitor "$mon_pedido" "$alvo" || return 1
+    mon="$mon_pedido"
+  else
+    mon=$(mon_por_orientacao "$alvo") || { echo "erro: nao foi possivel detectar monitor $alvo (verifique hyprctl)" >&2; return 1; }
+    if [ -z "$mon" ]; then
+      echo "erro: nenhum monitor $alvo detectado" >&2
+      return 1
+    fi
+    if [[ ! "$mon" =~ $MONITOR_RE ]]; then
+      echo "erro: hyprctl reportou um nome de monitor inesperado: '$mon'" >&2
+      return 1
+    fi
+  fi
+
+  # Propaga o codigo de saida do CLI: engoli-lo fazia `wp` sair 0 mesmo quando
+  # nada era gravado.
   "$CLI" set "$mon" "$f"
 }
 
+uso() {
+  cat <<'EOF'
+uso: wp                    lista os dois catalogos
+     wp h <n> [MONITOR]    aplica a n-esima arte deitada
+     wp v <n> [MONITOR]    aplica a n-esima arte em pe
+     wp h | wp v           so lista o catalogo correspondente
+
+MONITOR e opcional: por padrao wp escolhe o primeiro monitor com a orientacao
+pedida. Passe o nome (como aparece em `hyprctl monitors`) quando houver mais de
+um monitor na mesma orientacao. Ex.: wp h 5 DP-3
+EOF
+}
+
+rc=0
 case "${1:-}" in
-  h|horizontal|deitada) [ $# -ge 2 ] && aplica 16x9 "$2" landscape || lista 16x9 "DEITADAS (monitor horizontal)" ;;
-  v|vertical|pe)        [ $# -ge 2 ] && aplica 9x16 "$2" portrait  || lista 9x16 "EM PE (monitor vertical)" ;;
-  ""|list|-l)           lista 16x9 "DEITADAS (monitor horizontal)"; echo; lista 9x16 "EM PE (monitor vertical)";
-                        echo; echo "uso: wp h <n>   |   wp v <n>" ;;
-  *) echo "uso: wp [h|v] [numero]"; exit 1 ;;
+  h|horizontal|deitada)
+    # if/then/else explicito: com `A && B || C`, uma falha do aplica caia no
+    # `||` e imprimia o catalogo, sem erro nenhum na tela -- o usuario via a
+    # lista e achava que tinha dado certo.
+    if [ $# -ge 2 ]; then
+      aplica 16x9 "$2" landscape "${3:-}" || rc=$?
+    else
+      lista 16x9 "DEITADAS (monitor horizontal)" || rc=$?
+    fi
+    ;;
+  v|vertical|pe)
+    if [ $# -ge 2 ]; then
+      aplica 9x16 "$2" portrait "${3:-}" || rc=$?
+    else
+      lista 9x16 "EM PE (monitor vertical)" || rc=$?
+    fi
+    ;;
+  ""|list|-l)
+    lista 16x9 "DEITADAS (monitor horizontal)" || rc=$?
+    echo
+    lista 9x16 "EM PE (monitor vertical)" || rc=$?
+    echo
+    uso
+    ;;
+  -h|--help|help)
+    uso
+    ;;
+  *)
+    uso >&2
+    rc=1
+    ;;
 esac
+
+exit "$rc"

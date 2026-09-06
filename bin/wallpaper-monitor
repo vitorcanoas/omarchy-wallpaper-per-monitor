@@ -27,6 +27,13 @@ set -euo pipefail
 
 OVERRIDE_JSON="${HOME}/.config/omarchy/background-per-monitor.json"
 
+# Codigos de saida:
+#   1 = erro de uso / argumento invalido
+#   2 = JSON existe mas esta ilegivel (NADA foi alterado)
+#   3 = nao foi possivel serializar a escrita (lock)
+EXIT_UNREADABLE=2
+EXIT_LOCK=3
+
 usage() {
   cat >&2 <<EOF
 Uso:
@@ -50,38 +57,270 @@ EOF
   exit 1
 }
 
+# ---------------------------------------------------------------------------
+# Serializacao das escritas.
+#
+# A substituicao final (mv) ja era atomica, mas o ciclo le-modifica-grava nao
+# era serializado: `wp h 3 & wp v 5 &` fazia os dois lerem o mesmo JSON antigo
+# e o perdedor sumia do arquivo. O lock abaixo cobre migrate+leitura+escrita
+# inteira, de ponta a ponta.
+#
+# Lock por DIRETORIO (mkdir), nao por `flock 9>arquivo`: mkdir nao segue
+# symlink no componente final, entao o caminho do lock nunca e aberto atraves
+# de um link plantado por outro processo. Mesma tecnica ja aprovada no PR #8 de
+# vitorcanoas/omarchy-nightlight (commit 78d9fb4), exigida pelo mantenedor do
+# marketplace Omarchy.
+RUNTIME_DIR=""
+LOCK=""
+
+runtime_dir_is_private() {
+  local dir=${1-} mode
+  [[ -n $dir && -d $dir && ! -L $dir && -O $dir ]] || return 1
+  mode=$(stat -c '%a' -- "$dir" 2>/dev/null) || return 1
+  [[ $mode == 700 ]]
+}
+
+# XDG_RUNTIME_DIR e um diretorio privado por definicao. Quando falta, cai para
+# um diretorio por usuario em /tmp, criado com modo 0700 e recusado se outro
+# usuario ja controla o nome. Nunca cai para um lock global.
+prepare_runtime_dir() {
+  local candidate tmp_mode
+  if [[ -n ${XDG_RUNTIME_DIR:-} ]] && runtime_dir_is_private "${XDG_RUNTIME_DIR:-}"; then
+    RUNTIME_DIR=$XDG_RUNTIME_DIR
+  else
+    candidate="/tmp/omarchy-wallpaper-monitor-${EUID}"
+    [[ -d /tmp && ! -L /tmp && -w /tmp && -k /tmp ]] || return 1
+    tmp_mode=$(stat -c '%a' -- /tmp 2>/dev/null) || return 1
+    (( 8#$tmp_mode & 01000 )) || return 1
+    [[ ! -L $candidate ]] || return 1
+    if [[ ! -e $candidate ]]; then
+      ( umask 077; mkdir -- "$candidate" ) 2>/dev/null || return 1
+    fi
+    runtime_dir_is_private "$candidate" || return 1
+    RUNTIME_DIR=$candidate
+  fi
+  LOCK="$RUNTIME_DIR/omarchy-wallpaper-monitor.lock.d"
+}
+
+acquire_lock() {
+  local path=$1 deadline=$((SECONDS + 5)) owner created now
+  while :; do
+    [[ ! -L $path && ( ! -e $path || -d $path ) ]] || return 1
+    if ( umask 077; mkdir -- "$path" ) 2>/dev/null; then
+      if printf '%s\n' "$$" >"$path/pid" 2>/dev/null; then
+        return 0
+      fi
+      rm -f -- "$path/pid" 2>/dev/null || true
+      rmdir -- "$path" 2>/dev/null || true
+      return 1
+    fi
+
+    [[ ! -L $path && -d $path ]] || return 1
+    owner=$(cat -- "$path/pid" 2>/dev/null || true)
+    if [[ $owner =~ ^[0-9]+$ ]] && ! kill -0 "$owner" 2>/dev/null; then
+      rm -f -- "$path/pid" 2>/dev/null || true
+      rmdir -- "$path" 2>/dev/null || true
+      continue
+    fi
+    if [[ ! $owner =~ ^[0-9]+$ ]]; then
+      # SIGKILL entre o mkdir e a gravacao do pid deixa um lock valido sem dono.
+      # Nao remove um lock que pode ter nascido agora; passado o timeout normal
+      # de aquisicao e seguro recuperar esse lock incompleto.
+      created=$(stat -c '%Y' -- "$path" 2>/dev/null || echo 0)
+      now=$(date +%s 2>/dev/null || echo 0)
+      if [[ $created =~ ^[0-9]+$ && $now =~ ^[0-9]+$ ]] && (( now - created >= 5 )); then
+        rmdir -- "$path" 2>/dev/null || true
+        continue
+      fi
+    fi
+    (( SECONDS >= deadline )) && return 1
+    LC_ALL=C sleep 0.05 || return 1
+  done
+}
+
+release_lock() {
+  local path=${1-}
+  [[ -n $path && ! -L $path && -d $path ]] || return 0
+  rm -f -- "$path/pid" 2>/dev/null || true
+  rmdir -- "$path" 2>/dev/null || true
+}
+
+# Executa "$@" com o lock de escrita segurado. Sai com erro claro se nao
+# conseguir serializar -- melhor recusar do que gravar por cima de outro.
+with_lock() {
+  if ! prepare_runtime_dir; then
+    echo "erro: nao foi possivel preparar um diretorio de runtime privado para o lock; nada foi alterado" >&2
+    exit "$EXIT_LOCK"
+  fi
+  if ! acquire_lock "$LOCK"; then
+    echo "erro: outro wallpaper-monitor esta gravando (lock: $LOCK); nada foi alterado" >&2
+    exit "$EXIT_LOCK"
+  fi
+  trap 'release_lock "$LOCK"' EXIT
+  "$@"
+}
+
 ensure_json_exists() {
   if [[ ! -f "$OVERRIDE_JSON" ]]; then
     mkdir -p "$(dirname "$OVERRIDE_JSON")"
-    printf '{\n  "monitors": {}\n}\n' > "$OVERRIDE_JSON"
+    ( umask 022; printf '{\n  "monitors": {}\n}\n' > "$OVERRIDE_JSON" )
   fi
+}
+
+# Trecho Python compartilhado: le o JSON de destino com as validacoes que o
+# mantenedor do marketplace exige (no-follow, arquivo regular, dono, tamanho
+# limitado) e distingue "nao existe" (ok, comeca vazio) de "existe mas esta
+# ilegivel" (ERRO -- nada pode ser alterado).
+#
+# Nunca interpolar dado externo aqui dentro: tudo entra por argv.
+read_json_py() {
+  cat <<'PYEOF'
+import json
+import os
+import stat
+import sys
+
+MAX_BYTES = 1 << 20  # 1 MiB: um mapa de overrides nao chega perto disso
+
+
+def load_target(path):
+    """Retorna (data, existia). Levanta SystemExit(2) se existir e for ilegivel."""
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    except FileNotFoundError:
+        return {}, False
+    except OSError as e:
+        print(
+            f"erro: {path} existe mas esta ilegivel ({e}) -- nada foi alterado",
+            file=sys.stderr,
+        )
+        raise SystemExit(2)
+
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            print(
+                f"erro: {path} existe mas nao e um arquivo regular -- nada foi alterado",
+                file=sys.stderr,
+            )
+            raise SystemExit(2)
+        if st.st_uid != os.geteuid():
+            print(
+                f"erro: {path} pertence a outro usuario (uid {st.st_uid}) -- nada foi alterado",
+                file=sys.stderr,
+            )
+            raise SystemExit(2)
+        if st.st_size > MAX_BYTES:
+            print(
+                f"erro: {path} tem {st.st_size} bytes (limite {MAX_BYTES}) -- nada foi alterado",
+                file=sys.stderr,
+            )
+            raise SystemExit(2)
+        raw = os.read(fd, MAX_BYTES)
+    finally:
+        os.close(fd)
+
+    if not raw.strip():
+        # Arquivo vazio: trata como "ainda nao configurado", nao como corrupcao.
+        return {}, True
+
+    try:
+        data = json.loads(raw.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError) as e:
+        print(
+            f"erro: {path} existe mas esta ilegivel ({e}) -- nada foi alterado.",
+            file=sys.stderr,
+        )
+        print(
+            "       conserte o arquivo a mao ou remova-o para recomecar do zero.",
+            file=sys.stderr,
+        )
+        raise SystemExit(2)
+
+    if not isinstance(data, dict):
+        print(
+            f"erro: {path} existe mas nao contem um objeto JSON -- nada foi alterado.",
+            file=sys.stderr,
+        )
+        print(
+            "       conserte o arquivo a mao ou remova-o para recomecar do zero.",
+            file=sys.stderr,
+        )
+        raise SystemExit(2)
+
+    return data, True
+
+
+def write_atomic(path, data, mode=None):
+    """Grava data em path via temp no MESMO diretorio + fsync + rename."""
+    import tempfile
+
+    directory = os.path.dirname(path) or "."
+    if mode is None:
+        try:
+            mode = stat.S_IMODE(os.stat(path).st_mode)
+        except OSError:
+            mode = 0o644
+
+    fd, tmp_path = tempfile.mkstemp(dir=directory, prefix=".background-per-monitor.", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+            f.write("\n")
+            f.flush()
+            os.fsync(f.fileno())
+        # mkstemp cria 0600; preserva o modo do original (ou 644) para o arquivo
+        # nao virar ilegivel para o resto da sessao do usuario.
+        os.chmod(tmp_path, mode)
+        os.replace(tmp_path, path)
+        tmp_path = None
+    finally:
+        if tmp_path is not None:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+
+    # Durabilidade do rename: sem isso um corte de energia logo depois pode
+    # deixar o diretorio sem a entrada nova.
+    try:
+        dfd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(dfd)
+        finally:
+            os.close(dfd)
+    except OSError:
+        pass
+
+
+def normalize(data):
+    if not isinstance(data.get("monitors"), dict):
+        data["monitors"] = {}
+    return data
+PYEOF
 }
 
 # Migra o JSON do formato antigo (plano, sem "monitors") para o novo
 # ({"monitors": {...}}), preservando o conteudo. Faz backup antes. E
 # idempotente: se ja estiver no formato novo, nao faz nada (nem backup).
+#
+# So e chamada por comandos de ESCRITA, e sempre com o lock ja segurado.
 migrate_if_needed() {
   ensure_json_exists
 
   local needs_migration
-  needs_migration="$(python3 - "$OVERRIDE_JSON" <<'PYEOF'
-import json
-import sys
+  needs_migration="$(python3 - "$OVERRIDE_JSON" <<PYEOF
+$(read_json_py)
 
 json_path = sys.argv[1]
-try:
-    with open(json_path, "r", encoding="utf-8") as f:
-        data = json.load(f)
-except (ValueError, OSError) as e:
-    print(f"aviso: JSON ilegivel em {json_path} ({e}) -- tratando como formato antigo/vazio", file=sys.stderr)
-    data = {}
+data, _existed = load_target(json_path)
 
-if isinstance(data, dict) and "monitors" in data and isinstance(data["monitors"], dict):
+if "monitors" in data and isinstance(data["monitors"], dict):
     print("no")
 else:
     print("yes")
 PYEOF
-)"
+)" || exit "$EXIT_UNREADABLE"
 
   if [[ "$needs_migration" != "yes" ]]; then
     return 0
@@ -89,45 +328,40 @@ PYEOF
 
   local bak
   bak="${OVERRIDE_JSON}.bak.$(date +%Y%m%d-%H%M%S)"
-  cp -- "$OVERRIDE_JSON" "$bak"
+  cp -p -- "$OVERRIDE_JSON" "$bak"
   echo "aviso: JSON no formato antigo detectado -- migrando para o formato novo (backup: $bak)" >&2
 
-  local tmp
-  tmp="$(mktemp "${OVERRIDE_JSON}.XXXXXX")"
-  trap 'rm -f "$tmp"' EXIT
+  python3 - "$OVERRIDE_JSON" <<PYEOF || exit "$EXIT_UNREADABLE"
+$(read_json_py)
 
-  python3 - "$OVERRIDE_JSON" "$tmp" <<'PYEOF'
-import json
-import sys
-
-json_path, tmp_path = sys.argv[1:3]
-
-try:
-    with open(json_path, "r", encoding="utf-8") as f:
-        data = json.load(f)
-except (ValueError, OSError) as e:
-    print(f"aviso: JSON ilegivel em {json_path} ({e}) -- migrando a partir de vazio", file=sys.stderr)
-    data = {}
-
-if not isinstance(data, dict):
-    data = {}
+json_path = sys.argv[1]
+data, _existed = load_target(json_path)
 
 # Formato antigo: objeto plano monitor -> caminho. Formato novo: tudo isso
-# vira o mapa "monitors", preservando chaves que ja porventura sejam
-# "portrait"/"landscape" so se o objeto ja tiver "monitors" (o que a funcao
-# chamadora ja garantiu que nao e o caso aqui).
-migrated = {"monitors": data}
-
-with open(tmp_path, "w", encoding="utf-8") as f:
-    json.dump(migrated, f, indent=2, ensure_ascii=False)
-    f.write("\n")
+# vira o mapa "monitors". A funcao chamadora ja garantiu que "monitors" ainda
+# nao existe como dict aqui.
+write_atomic(json_path, {"monitors": data})
 PYEOF
-
-  mv "$tmp" "$OVERRIDE_JSON"
-  trap - EXIT
 }
 
-# Resolve um caminho de imagem para absoluto e confere que existe.
+# Resolve um caminho de imagem para absoluto, confere que existe e que e mesmo
+# uma imagem -- `set DP-1 /etc/hostname` gravava sem reclamar e o usuario so
+# descobria pela tela preta.
+# Nomes de monitor vem de conectores do kernel (DP-2, HDMI-A-1, eDP-1), entao a
+# forma real e sempre alfanumerica com . _ : -. Recusar o resto nao e defesa
+# contra injecao -- os dados sempre cruzam por argv, nunca sao interpolados em
+# codigo -- e sim contra a falha SILENCIOSA: gravar override para um nome que
+# nenhum monitor pode ter faz o wallpaper simplesmente nao aparecer, sem erro.
+valida_nome_monitor() {
+  local monitor="$1"
+  if [[ ! "$monitor" =~ ^[A-Za-z0-9._:-]+$ ]]; then
+    echo "erro: nome de monitor invalido: $monitor" >&2
+    echo "       use o nome do conector, como aparece em 'wallpaper-monitor list'" >&2
+    echo "       (letras, numeros e . _ : -)" >&2
+    exit 1
+  fi
+}
+
 resolve_image() {
   local image="$1"
   local abs_image
@@ -136,61 +370,84 @@ resolve_image() {
     echo "erro: arquivo de imagem nao existe: $abs_image" >&2
     exit 1
   fi
+
+  local mime=""
+  if command -v file >/dev/null 2>&1; then
+    mime="$(file -b --mime-type -- "$abs_image" 2>/dev/null || true)"
+  fi
+
+  if [[ -n "$mime" ]]; then
+    if [[ "$mime" != image/* ]]; then
+      echo "erro: nao parece uma imagem: $abs_image (mime: $mime)" >&2
+      exit 1
+    fi
+  else
+    # Sem `file` disponivel, cai para a extensao -- pior que o mime, mas ainda
+    # pega o caso comum de apontar para um arquivo de texto por engano.
+    local lower="${abs_image,,}"
+    case "$lower" in
+      *.png|*.jpg|*.jpeg|*.webp|*.avif|*.bmp|*.gif|*.tif|*.tiff) ;;
+      *)
+        echo "erro: extensao nao reconhecida como imagem: $abs_image" >&2
+        exit 1
+        ;;
+    esac
+  fi
+
   printf '%s' "$abs_image"
 }
 
 cmd_set() {
-  local monitor="${1:-}"
-  local image="${2:-}"
+  if [[ $# -ne 2 ]]; then
+    echo "erro: uso: wallpaper-monitor set <MONITOR> <caminho-imagem>" >&2
+    exit 1
+  fi
+
+  local monitor="$1"
+  local image="$2"
 
   if [[ -z "$monitor" || -z "$image" ]]; then
     echo "erro: uso: wallpaper-monitor set <MONITOR> <caminho-imagem>" >&2
     exit 1
   fi
 
+  valida_nome_monitor "$monitor"
+
   local abs_image
   abs_image="$(resolve_image "$image")"
 
-  migrate_if_needed
-
-  local tmp
-  tmp="$(mktemp "${OVERRIDE_JSON}.XXXXXX")"
-  trap 'rm -f "$tmp"' EXIT
-
-  python3 - "$OVERRIDE_JSON" "$monitor" "$abs_image" "$tmp" <<'PYEOF'
-import json
-import sys
-
-json_path, monitor, image, tmp_path = sys.argv[1:5]
-
-try:
-    with open(json_path, "r", encoding="utf-8") as f:
-        data = json.load(f)
-except (ValueError, OSError) as e:
-    print(f"aviso: JSON ilegivel em {json_path} ({e}) -- recomecando do zero", file=sys.stderr)
-    data = {}
-if not isinstance(data, dict):
-    data = {}
-if not isinstance(data.get("monitors"), dict):
-    data["monitors"] = {}
-
-data["monitors"][monitor] = image
-
-with open(tmp_path, "w", encoding="utf-8") as f:
-    json.dump(data, f, indent=2, ensure_ascii=False)
-    f.write("\n")
-PYEOF
-
-  mv "$tmp" "$OVERRIDE_JSON"
-  trap - EXIT
+  with_lock cmd_set_locked "$monitor" "$abs_image"
 
   echo "ok: $monitor -> $abs_image"
 }
 
+cmd_set_locked() {
+  local monitor="$1" abs_image="$2"
+
+  migrate_if_needed
+
+  python3 - "$OVERRIDE_JSON" "$monitor" "$abs_image" <<PYEOF || exit "$EXIT_UNREADABLE"
+$(read_json_py)
+
+json_path, monitor, image = sys.argv[1:4]
+
+data, _existed = load_target(json_path)
+data = normalize(data)
+data["monitors"][monitor] = image
+write_atomic(json_path, data)
+PYEOF
+}
+
 cmd_set_orientation() {
   local key="$1"
-  local image="${2:-}"
+  shift
 
+  if [[ $# -ne 1 ]]; then
+    echo "erro: uso: wallpaper-monitor set-${key} <caminho-imagem>" >&2
+    exit 1
+  fi
+
+  local image="$1"
   if [[ -z "$image" ]]; then
     echo "erro: uso: wallpaper-monitor set-${key} <caminho-imagem>" >&2
     exit 1
@@ -199,169 +456,199 @@ cmd_set_orientation() {
   local abs_image
   abs_image="$(resolve_image "$image")"
 
-  migrate_if_needed
-
-  local tmp
-  tmp="$(mktemp "${OVERRIDE_JSON}.XXXXXX")"
-  trap 'rm -f "$tmp"' EXIT
-
-  python3 - "$OVERRIDE_JSON" "$key" "$abs_image" "$tmp" <<'PYEOF'
-import json
-import sys
-
-json_path, key, image, tmp_path = sys.argv[1:5]
-
-try:
-    with open(json_path, "r", encoding="utf-8") as f:
-        data = json.load(f)
-except (ValueError, OSError) as e:
-    print(f"aviso: JSON ilegivel em {json_path} ({e}) -- recomecando do zero", file=sys.stderr)
-    data = {}
-if not isinstance(data, dict):
-    data = {}
-if not isinstance(data.get("monitors"), dict):
-    data["monitors"] = {}
-
-data[key] = image
-
-with open(tmp_path, "w", encoding="utf-8") as f:
-    json.dump(data, f, indent=2, ensure_ascii=False)
-    f.write("\n")
-PYEOF
-
-  mv "$tmp" "$OVERRIDE_JSON"
-  trap - EXIT
+  with_lock cmd_set_orientation_locked "$key" "$abs_image"
 
   echo "ok: ${key} -> $abs_image"
 }
 
-cmd_clear() {
-  local monitor="${1:-}"
+cmd_set_orientation_locked() {
+  local key="$1" abs_image="$2"
 
+  migrate_if_needed
+
+  python3 - "$OVERRIDE_JSON" "$key" "$abs_image" <<PYEOF || exit "$EXIT_UNREADABLE"
+$(read_json_py)
+
+json_path, key, image = sys.argv[1:4]
+
+data, _existed = load_target(json_path)
+data = normalize(data)
+data[key] = image
+write_atomic(json_path, data)
+PYEOF
+}
+
+cmd_clear() {
+  if [[ $# -ne 1 ]]; then
+    echo "erro: uso: wallpaper-monitor clear <MONITOR>" >&2
+    exit 1
+  fi
+
+  local monitor="$1"
   if [[ -z "$monitor" ]]; then
     echo "erro: uso: wallpaper-monitor clear <MONITOR>" >&2
     exit 1
   fi
 
-  migrate_if_needed
+  valida_nome_monitor "$monitor"
 
-  local tmp
-  tmp="$(mktemp "${OVERRIDE_JSON}.XXXXXX")"
-  trap 'rm -f "$tmp"' EXIT
-
-  python3 - "$OVERRIDE_JSON" "$monitor" "$tmp" <<'PYEOF'
-import json
-import sys
-
-json_path, monitor, tmp_path = sys.argv[1:4]
-
-try:
-    with open(json_path, "r", encoding="utf-8") as f:
-        data = json.load(f)
-except (ValueError, OSError) as e:
-    print(f"aviso: JSON ilegivel em {json_path} ({e}) -- recomecando do zero", file=sys.stderr)
-    data = {}
-if not isinstance(data, dict):
-    data = {}
-if isinstance(data.get("monitors"), dict):
-    data["monitors"].pop(monitor, None)
-
-with open(tmp_path, "w", encoding="utf-8") as f:
-    json.dump(data, f, indent=2, ensure_ascii=False)
-    f.write("\n")
-PYEOF
-
-  mv "$tmp" "$OVERRIDE_JSON"
-  trap - EXIT
+  with_lock cmd_clear_locked "$monitor"
 
   echo "ok: override removido para $monitor (volta ao default de orientacao ou ao wallpaper padrao)"
 }
 
-cmd_clear_orientation() {
-  local key="$1"
+cmd_clear_locked() {
+  local monitor="$1"
 
   migrate_if_needed
 
-  local tmp
-  tmp="$(mktemp "${OVERRIDE_JSON}.XXXXXX")"
-  trap 'rm -f "$tmp"' EXIT
+  python3 - "$OVERRIDE_JSON" "$monitor" <<PYEOF || exit "$EXIT_UNREADABLE"
+$(read_json_py)
 
-  python3 - "$OVERRIDE_JSON" "$key" "$tmp" <<'PYEOF'
-import json
-import sys
+json_path, monitor = sys.argv[1:3]
 
-json_path, key, tmp_path = sys.argv[1:4]
-
-try:
-    with open(json_path, "r", encoding="utf-8") as f:
-        data = json.load(f)
-except (ValueError, OSError) as e:
-    print(f"aviso: JSON ilegivel em {json_path} ({e}) -- recomecando do zero", file=sys.stderr)
-    data = {}
-if not isinstance(data, dict):
-    data = {}
-data.pop(key, None)
-
-with open(tmp_path, "w", encoding="utf-8") as f:
-    json.dump(data, f, indent=2, ensure_ascii=False)
-    f.write("\n")
+data, _existed = load_target(json_path)
+data = normalize(data)
+data["monitors"].pop(monitor, None)
+write_atomic(json_path, data)
 PYEOF
+}
 
-  mv "$tmp" "$OVERRIDE_JSON"
-  trap - EXIT
+cmd_clear_orientation() {
+  local key="$1"
+  shift
+
+  if [[ $# -ne 0 ]]; then
+    echo "erro: uso: wallpaper-monitor clear-${key} (sem argumentos)" >&2
+    exit 1
+  fi
+
+  with_lock cmd_clear_orientation_locked "$key"
 
   echo "ok: default de ${key} removido"
 }
 
-cmd_list() {
+cmd_clear_orientation_locked() {
+  local key="$1"
+
   migrate_if_needed
 
+  python3 - "$OVERRIDE_JSON" "$key" <<PYEOF || exit "$EXIT_UNREADABLE"
+$(read_json_py)
+
+json_path, key = sys.argv[1:3]
+
+data, _existed = load_target(json_path)
+data.pop(key, None)
+write_atomic(json_path, data)
+PYEOF
+}
+
+# list e READ-ONLY: nunca migra, nunca grava. Um comando de diagnostico que
+# reescreve o arquivo que voce esta tentando diagnosticar e o pior tipo de bug
+# -- antes desta correcao, um `list` num JSON corrompido apagava todos os
+# overrides.
+cmd_list() {
+  if [[ $# -ne 0 ]]; then
+    echo "erro: uso: wallpaper-monitor list (sem argumentos)" >&2
+    exit 1
+  fi
+
   echo "== Overrides configurados ($OVERRIDE_JSON) =="
-  python3 - "$OVERRIDE_JSON" <<'PYEOF'
-import json
-import sys
+  local rc=0
+  python3 - "$OVERRIDE_JSON" <<PYEOF || rc=$?
+$(read_json_py)
 
 json_path = sys.argv[1]
-try:
-    with open(json_path, encoding="utf-8") as f:
-        data = json.load(f)
-except (ValueError, OSError) as e:
-    print(f"  (JSON ilegivel: {e})", file=sys.stderr)
-    data = {}
+data, existed = load_target(json_path)
 
-if not isinstance(data, dict):
-    data = {}
+if not existed:
+    print("  (nenhum override configurado ainda -- o arquivo nem existe)")
+    raise SystemExit(0)
 
 monitors = data.get("monitors")
 monitors = monitors if isinstance(monitors, dict) else {}
+
+# Formato antigo (plano): mostra assim mesmo, sem migrar. list e read-only.
+if not monitors and any(
+    k not in ("monitors", "portrait", "landscape") for k in data
+):
+    print("  (formato antigo, plano -- sera migrado na proxima escrita)")
+    monitors = {k: v for k, v in data.items() if k not in ("portrait", "landscape")}
 
 if not monitors:
     print("  (nenhum override de monitor definido)")
 else:
     for monitor, path in monitors.items():
-        print(f"  {monitor} -> {path}")
+        if isinstance(path, str):
+            print(f"  {monitor} -> {path}")
+        else:
+            print(f"  {monitor} -> (valor invalido, nao e um caminho: {path!r})")
 
 print()
-print("  portrait  -> " + data.get("portrait", "(nao definido)"))
-print("  landscape -> " + data.get("landscape", "(nao definido)"))
+for key in ("portrait", "landscape"):
+    value = data.get(key)
+    label = key.ljust(9)
+    if value is None:
+        print(f"  {label} -> (nao definido)")
+    elif isinstance(value, str):
+        print(f"  {label} -> {value}")
+    else:
+        print(f"  {label} -> (valor invalido, nao e um caminho: {value!r})")
 PYEOF
+
+  if [[ $rc -ne 0 ]]; then
+    exit "$EXIT_UNREADABLE"
+  fi
 
   echo
   echo "== Monitores detectados (hyprctl monitors -j) =="
   if command -v hyprctl >/dev/null 2>&1; then
-    hyprctl monitors -j | python3 - <<'PYEOF'
+    local hypr_raw=""
+    hypr_raw="$(hyprctl monitors -j 2>/dev/null)" || hypr_raw=""
+    # O JSON entra por argv, nao por stdin: `hyprctl | python3 - <<EOF` faz o
+    # heredoc virar o stdin do python, entao sys.stdin.read() leria o proprio
+    # script e o hyprctl levava SIGPIPE.
+    python3 - "$hypr_raw" <<'PYEOF'
 import json
 import sys
 
-raw = sys.stdin.read()
+raw = sys.argv[1]
 try:
     monitors = json.loads(raw) if raw.strip() else []
 except ValueError as e:
     print(f"  (falha ao ler hyprctl monitors -j: {e})", file=sys.stderr)
     monitors = []
 
+if not isinstance(monitors, list):
+    monitors = []
+
 for m in monitors:
-    print(f"  {m['name']} ({m['width']}x{m['height']}, transform={m.get('transform', 0)})")
+    if not isinstance(m, dict):
+        continue
+    name = m.get("name")
+    if not name:
+        continue
+    width = m.get("width")
+    height = m.get("height")
+    transform = m.get("transform", 0)
+    if not isinstance(transform, int):
+        transform = 0
+
+    if isinstance(width, int) and isinstance(height, int):
+        # hyprctl reporta a dimensao FISICA do modo; transform impar inverte
+        # w/h na tela. Imprimir a fisica fazia o usuario ler "1920x1080" para
+        # um monitor que o `wp` trata (corretamente) como retrato, e configurar
+        # o monitor errado. Ver docs/CONTEXTO.md secao e.
+        w, h = (height, width) if transform % 2 else (width, height)
+        orient = "portrait" if h > w else "landscape"
+        extra = f", fisico {width}x{height}" if (w, h) != (width, height) else ""
+        print(f"  {name} ({w}x{h} logico, {orient}, transform={transform}{extra})")
+    else:
+        print(f"  {name} (dimensoes desconhecidas, transform={transform})")
+
+    if m.get("disabled"):
+        print("      (desativado -- nao recebe wallpaper)")
 PYEOF
   else
     echo "  (hyprctl nao encontrado)"
@@ -377,8 +664,8 @@ main() {
     set-portrait)    cmd_set_orientation portrait "$@" ;;
     set-landscape)   cmd_set_orientation landscape "$@" ;;
     clear)           cmd_clear "$@" ;;
-    clear-portrait)  cmd_clear_orientation portrait ;;
-    clear-landscape) cmd_clear_orientation landscape ;;
+    clear-portrait)  cmd_clear_orientation portrait "$@" ;;
+    clear-landscape) cmd_clear_orientation landscape "$@" ;;
     list)            cmd_list "$@" ;;
     *)               usage ;;
   esac
