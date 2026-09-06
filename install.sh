@@ -255,7 +255,13 @@ else
   printf '{}\n' >"$SHELL_JSON"
 fi
 
-TMP_JSON="$(mktemp)"
+# Temp file in the DESTINATION directory, not /tmp: on this system /tmp is
+# tmpfs and $HOME is btrfs, so `mv` across them is copy+unlink, not an atomic
+# rename. A crash mid-copy would leave a TRUNCATED shell.json -- which is the
+# file the whole shell reads at startup. Same directory means same filesystem
+# means rename(2), which is atomic: readers see either the old file or the new
+# one, never half of one.
+TMP_JSON="$(mktemp -p "$(dirname "$SHELL_JSON")" .shell.json.XXXXXX)"
 # plugins[] entries are objects ({"id": "..."}, sometimes with extra
 # per-plugin settings alongside), not bare strings -- confirmed against a
 # real shell.json. disabledPlugins[] is a flat string array. Dedupe plugins[]
@@ -399,7 +405,10 @@ MSG
 
   # temp + mv, so a failure part-way through never leaves a truncated menu
   # file behind (an unparseable one costs the user their whole menu).
-  TMP_MENU="$(mktemp)"
+  # Mesmo motivo do TMP_JSON acima: temp no diretorio de DESTINO, para que o
+  # mv seja rename(2) atomico. Um omarchy-menu.jsonc truncado custa ao usuario
+  # o menu inteiro dele.
+  TMP_MENU="$(mktemp -p "$(dirname "$MENU_JSONC")" .omarchy-menu.jsonc.XXXXXX)"
   # Insere logo APOS a "{" de abertura, nao antes da "}" final.
   #
   # Inserir no fim parece natural e esta errado: a linha cairia depois da

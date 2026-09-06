@@ -179,7 +179,8 @@ MSG
   cp "$MENU_JSONC" "$backup"
   printf '==> backed up %s -> %s\n' "$MENU_JSONC" "$backup"
 
-  TMP_MENU="$(mktemp)"
+  # Temp no diretorio de destino: mv vira rename(2) atomico. Ver install.sh.
+  TMP_MENU="$(mktemp -p "$(dirname "$MENU_JSONC")" .omarchy-menu.jsonc.XXXXXX)"
   # awk with fixed-string comparison (index/==), never a regex: the markers
   # contain "/" and "." and ">", which in a regex would match more than the
   # literal marker line.
@@ -240,7 +241,8 @@ if [[ -f $SHELL_JSON ]]; then
     cp "$SHELL_JSON" "$BACKUP"
     printf '==> backed up %s -> %s\n' "$SHELL_JSON" "$BACKUP"
 
-    TMP_JSON="$(mktemp)"
+    # Temp no diretorio de destino: mv vira rename(2) atomico. Ver install.sh.
+    TMP_JSON="$(mktemp -p "$(dirname "$SHELL_JSON")" .shell.json.XXXXXX)"
     jq \
       --arg plugin "$PLUGIN_ID" \
       --arg native "$NATIVE_PLUGIN_ID" \
