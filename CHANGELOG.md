@@ -4,6 +4,120 @@ All notable changes to Omarchy Wallpaper Per Monitor are documented here.
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-09-06
+
+Hardening pass: a four-front adversarial code review over the committed
+code, every finding required to come with a concrete reproducible scenario,
+then applied and validated on the live shell (two monitors, one of them
+rotated). Adds a visual entry to the Omarchy menu.
+
+### Added
+
+- **Menu entry under Style > Wallpaper per monitor**, reachable from the
+  Omarchy menu (SUPER+SPACE): pick a monitor, then pick the art from a
+  thumbnail grid. `bin/wallpaper-monitor-menu` opens the catalogue matching
+  that monitor's *orientation* -- offering landscape art for a portrait
+  screen is the letterboxing this plugin exists to avoid. Cancelling at any
+  step exits 0 without applying anything.
+
+  It deliberately does **not** declare `kind:"menu"`: that kind opens a
+  separate IPC-summoned window rather than contributing a row to the main
+  menu. The row is injected into `~/.config/omarchy/extensions/omarchy-menu.jsonc`,
+  which the shell merges over its default menu at runtime and watches for
+  changes. The manifest is therefore unchanged -- the plugin is still
+  `kinds:["service"]`, and the service validated in production is untouched.
+
+  Thumbnails and search are Omarchy's own: `omarchy-menu-images` already
+  renders them with `vipsthumbnail`, caches them, and offers `--filterable`.
+  Nothing was reimplemented.
+
+- `uninstall.sh`, which did not exist. Removes the symlinks only when they
+  point at this plugin, restores `omarchy.background`, drops the menu row,
+  and never deletes the user's own `background-per-monitor.json`.
+
+- `SECURITY.md`, documenting the execution surface, the deliberate reuse of
+  the `"background"` IPC target, the atomic-write technique, and the absence
+  of network or credential access.
+
+### Fixed
+
+- **`wallpaper-monitor list` destroyed the user's overrides.** A read-only
+  command: on a corrupted JSON the `except` treated "unreadable" as
+  "old/empty format", migrated to `{"monitors":{}}` and wrote it back. Now
+  a missing file (start empty) and an unreadable one (abort, exit 2, change
+  nothing) are separate cases, and `list` never writes.
+
+- **Concurrent writes lost overrides.** `mktemp`+`mv` made the *replacement*
+  atomic, but the read-modify-write cycle was not serialized: two `wp` calls
+  at once (a repeated keybind) and the last one won. Now serialized with the
+  directory-lock technique already approved by the marketplace maintainer in
+  omarchy-nightlight PR #8 -- deliberately not `flock 9>path`, which that
+  same PR rejects for following a symlink at the final component -- plus
+  `fsync`. Measured: 12 concurrent writes preserved 0/12 before, 12/12 after.
+
+- **`finishTransition` locked up permanently on hotplug**, leaking the
+  crossfade images in VRAM until the shell restarted: reading `.baseReady`
+  off a destroyed panel yields `undefined`, so the guard returned early on
+  every later call and no event could re-trigger it. The same bug exists
+  upstream in PR #10249; it was inherited, not introduced.
+
+- **Crossfade layers decoded at native resolution with mipmaps**, and did so
+  even when `useOverride` was true and not one of their pixels was visible --
+  four wasted full-resolution decodes per theme switch in the production
+  configuration. With 8000px PNGs that peaked over 750 MB of VRAM for a
+  420 ms effect.
+
+- **A partial install could leave the system half-configured.** `shell.json`
+  was edited *before* the symlinks, so a collision at `~/.local/bin/wp`
+  (common: another tool) disabled the native wallpaper and then aborted. The
+  three links are now pre-checked without side effects; the script refuses
+  with "Nothing has been changed yet".
+
+- **`DRY_RUN=true` performed a real install** (the test was `== 1`). Only
+  `0` and `1` are accepted now, rather than guessed at.
+
+- **`wp` reported an empty catalogue from anywhere but its own checkout.**
+  `BASE=$(dirname $0)/..` resolved to the installed plugin directory when
+  called through the `~/.local/bin` symlink -- which holds no `render/` -- so
+  `wp h` printed "(sem 16x9)" and exited 0, indistinguishable from "no art".
+  Resolution now matches the menu's exactly, so the number the menu shows and
+  the one `wp` applies can never come from different catalogues.
+
+- **The menu row insertion corrupted `omarchy-menu.jsonc`**, taking the
+  user's own menu entries with it. Inserting before the last `}` placed the
+  row after the user's final entry, which carries no trailing comma; the
+  shell's `JSON.parse` sits in a `try/catch` returning an empty list, so the
+  user would lose their own rows with no message at all. The row now goes in
+  right after the opening `{`. Caught in review, before the menu was ever
+  installed.
+
+- **A connector name containing a newline applied the wallpaper to a phantom
+  monitor**, silently and with exit 0: the TSV output is read line by line,
+  so `DP\n1` became two records and the name regex ran *after* the split, on
+  a fragment that passes it. Rejected at the source now.
+
+- **Writes were not actually atomic.** The temp file was created in `/tmp`
+  (tmpfs) with the destination in `$HOME` (btrfs), making `mv` a copy+unlink
+  rather than `rename(2)`. A crash mid-copy would truncate `shell.json` --
+  the file the whole shell reads at startup.
+
+- Malformed input no longer fails silently: `hyprctl` output without a
+  `transform` field, a monitor name that is not a string, `portrait`/
+  `landscape` keys holding a non-string, a disabled monitor being offered as
+  a target, and an index with a leading zero (`wp h 09`, which died with the
+  shell's octal error) all produce clear messages now.
+
+- Catalogue ordering is pinned with `LC_ALL=C`, so the number the user
+  memorises does not change between an interactive terminal and a keybind.
+
+- The per-monitor JSON keeps its file mode instead of inheriting `mktemp`'s.
+
+### Changed
+
+- Flat-format JSON now honours the `portrait`/`landscape` fallback, which the
+  code's own comment already promised but only applied to the new format.
+
+
 ### Fixed
 
 - `install.sh` ignored a test `HOME` override and silently wrote into the
