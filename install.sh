@@ -39,8 +39,18 @@ NATIVE_PLUGIN_ID="omarchy.background"
 
 DRY_RUN="${DRY_RUN:-0}"
 
-OMARCHY_CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/omarchy"
-BIN_DIR="${XDG_BIN_HOME:-$HOME/.local/bin}"
+## Deliberately NOT honoring XDG_CONFIG_HOME/XDG_BIN_HOME here: Omarchy's own
+## migrations always resolve shell.json as "$HOME/.config/omarchy/shell.json"
+## (see e.g. /usr/share/omarchy/migrations/1785344985.sh), never through the
+## XDG variable. Following that same convention keeps this installer
+## consistent with the shell.json Omarchy itself will read/write, and -- as a
+## bonus -- makes `HOME=/fake/home bash install.sh` fully sandboxed: on a
+## real desktop session XDG_CONFIG_HOME is exported (e.g. by the display
+## manager) as an ABSOLUTE path pointing at the real home, so it does not
+## follow a test HOME override, and reading it here would silently escape
+## the fake home and touch the real ~/.config/omarchy/shell.json.
+OMARCHY_CONFIG_DIR="$HOME/.config/omarchy"
+BIN_DIR="$HOME/.local/bin"
 
 if [[ $DRY_RUN == 1 ]]; then
   STAGE="$(mktemp -d)"
