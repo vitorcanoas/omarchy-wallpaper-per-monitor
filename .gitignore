@@ -1,0 +1,51 @@
+*.qmlc
+*.jsc
+.qmlls.ini
+.lint/
+
+# Local environment and editor files
+.env
+.env.*
+!.env.example
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# Timestamped backups (installer and manual saves)
+*.bak.*
+
+# Rendered wallpapers and render-engine output. The source art lives outside
+# this repo (~106MB) and is intentionally never versioned -- only the
+# docs/img illustrations are tracked.
+/wallpapers/
+/out/
+/render-out/
+*-upscaled.png
+*-realesrgan.png
+
+# Photographs. Illustrations in this repo are screenshots or diagrams.
+/preview.jpg
+/preview.jpeg
+/preview.png
+/setup*.jpg
+/docs/img/setup-real.*
+
+# Private key material
+*.pem
+*.key
+*.p12
+
+# AI assistant configuration -- not part of the plugin.
+/AGENTS.md
+/CLAUDE.md
+/GEMINI.md
+/CONVENTIONS.md
+/.cursorrules
+/.windsurfrules
+/.clinerules
+/.cursor/
+/.claude/
+/.continue/
+/.aider*
+/.github/copilot-instructions.md

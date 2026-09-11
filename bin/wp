@@ -1,0 +1,334 @@
+#!/usr/bin/env bash
+# wp - pick a wallpaper by number, per monitor.
+#   wp                 list both catalogues
+#   wp h 12            apply the 12th landscape image to the landscape monitor
+#   wp v 3             apply the 3rd portrait image to the portrait monitor
+#   wp h 12 DP-3       apply to monitor DP-3 (when several are landscape)
+#   wp h               list the landscape catalogue only
+# The monitor is found by its real orientation (hyprctl), never by a hardcoded
+# name.
+set -uo pipefail
+
+# LC_ALL=C pins the catalogue order. Without it the glob follows LC_COLLATE,
+# which differs between an interactive terminal and a keybind/systemd call --
+# the same `wp h 5` picked different art depending on where it was called from
+# (art-10 sorting before or after art-2). The numbering the user memorizes has
+# to be stable.
+export LC_ALL=C
+
+SELF="$(readlink -f "${BASH_SOURCE[0]}")"
+CLI="$(dirname "$SELF")/wallpaper-monitor"
+[[ -x $CLI ]] || CLI="wallpaper-monitor"
+
+# Root of the art catalogue. This resolution mirrors the one in
+# wallpaper-monitor-menu -- both must find the SAME catalogue, otherwise the
+# number the menu shows and the one `wp` applies come from different places.
+#
+# Order: $WALLPAPER_MONITOR_DIR > ~/Pictures/wallpapers/render > the root
+# deduced from already-written overrides > the checkout beside this script.
+#
+# That last item used to be the ONLY criterion (BASE=$(dirname $0)/..), so `wp
+# h` run through the ~/.local/bin symlink resolved to the installed plugin
+# directory -- which has no render/ at all. The command then printed
+# "(no 16x9)" and exited 0, as if the catalogue were empty: a silent failure,
+# indistinguishable from "there is no art". It only worked from the checkout.
+resolve_catalogue_root() {
+  if [[ -n ${WALLPAPER_MONITOR_DIR:-} ]]; then
+    # Set by hand: if it is wrong, say so -- silently falling through to
+    # another path would apply art from a catalogue the user did not ask for.
+    if [[ ! -d $WALLPAPER_MONITOR_DIR ]]; then
+      echo "error: WALLPAPER_MONITOR_DIR points to a nonexistent directory: $WALLPAPER_MONITOR_DIR" >&2
+      return 1
+    fi
+    printf '%s\n' "$WALLPAPER_MONITOR_DIR"
+    return 0
+  fi
+
+  [[ -d "$HOME/Pictures/wallpapers/render" ]] && {
+    printf '%s\n' "$HOME/Pictures/wallpapers/render"; return 0; }
+
+  # Deduce from an already-written override: a path like
+  # .../catalogue/render/16x9/art.png puts the root two levels above the file.
+  local j="$HOME/.config/omarchy/background-per-monitor.json" root
+  if [[ -f $j ]]; then
+    root="$(python3 - "$j" <<'PYEOF' 2>/dev/null || true
+import json, os, sys
+try:
+    if os.path.getsize(sys.argv[1]) > (1 << 20):
+        sys.exit(1)
+    with open(sys.argv[1], "rb") as fh:
+        d = json.loads(fh.read().decode("utf-8"))
+except (OSError, ValueError, UnicodeDecodeError):
+    sys.exit(1)
+if not isinstance(d, dict):
+    sys.exit(1)
+p = []
+m = d.get("monitors")
+if isinstance(m, dict):
+    p.extend(v for v in m.values() if isinstance(v, str))
+for k in ("portrait", "landscape"):
+    v = d.get(k)
+    if isinstance(v, str):
+        p.append(v)
+for c in p:
+    # Require BOTH that the parent is 16x9/9x16 AND that the root contains one
+    # of them. Without that, an override pointing at a loose image
+    # (~/Pictures/photo.png) would elect ~/ as the catalogue root -- which
+    # exists, so the test passed -- and `wp h` would again say "(no 16x9)" with
+    # rc=0. The criterion must be identical to wallpaper-monitor-menu's: if the
+    # two diverge, the number the menu shows and the art `wp` applies come from
+    # different catalogues.
+    d = os.path.dirname(c)
+    if os.path.basename(d) not in ("16x9", "9x16"):
+        continue
+    r = os.path.dirname(d)
+    if os.path.isdir(os.path.join(r, "16x9")) or os.path.isdir(os.path.join(r, "9x16")):
+        print(r)
+        break
+PYEOF
+)"
+    [[ -n $root && -d $root ]] && { printf '%s\n' "$root"; return 0; }
+  fi
+
+  # Last resort: the checkout beside this script.
+  local base
+  base="$(cd "$(dirname "$SELF")/.." && pwd)"
+  [[ -d "$base/render" ]] && { printf '%s\n' "$base/render"; return 0; }
+  return 1
+}
+
+if ! R="$(resolve_catalogue_root)"; then
+  echo "error: art catalogue not found." >&2
+  echo "       set WALLPAPER_MONITOR_DIR to the directory containing the" >&2
+  echo "       16x9/ and 9x16/ subdirectories, or create ~/Pictures/wallpapers/render." >&2
+  exit 1
+fi
+
+# Accepted monitor names. The pipeline below (print -> grep -c -> head -n1) is
+# newline-delimited, so a name containing \n would be truncated mid-way and the
+# override would go to a monitor that does not exist. Validating the format is
+# simpler than converting the whole pipeline to NUL, and real connector names
+# (DP-2, HDMI-A-1, eDP-1, desc:...) fit here comfortably.
+MONITOR_RE='^[A-Za-z0-9._:-]+$'
+
+mon_by_orientation() {  # $1 = portrait|landscape
+  command -v hyprctl >/dev/null 2>&1 || { echo "error: hyprctl not found (is Hyprland running?)" >&2; return 1; }
+  local candidates
+  candidates="$(hyprctl monitors -j | python3 -c "
+import sys, json
+
+target = sys.argv[1]
+raw = sys.stdin.read()
+if not raw.strip():
+    sys.exit(0)
+try:
+    monitors = json.loads(raw)
+except ValueError:
+    sys.exit(1)
+if not isinstance(monitors, list):
+    sys.exit(1)
+for m in monitors:
+    if not isinstance(m, dict):
+        continue
+    name = m.get('name')
+    if not name:
+        # A monitor with no name cannot be addressed; skipping it silently
+        # beats raising a traceback that the final error message would blame
+        # on hyprctl.
+        continue
+    # A disabled monitor shows nothing; writing an override for it looked like
+    # it worked and changed nothing on screen.
+    if m.get('disabled'):
+        continue
+    w = m.get('width')
+    h = m.get('height')
+    if not isinstance(w, int) or not isinstance(h, int):
+        continue
+    t = m.get('transform', 0)
+    if not isinstance(t, int):
+        t = 0
+    # odd transform = rotated, so swap w/h for the logical geometry
+    w, h = (h, w) if t % 2 else (w, h)
+    if (h > w and target == 'portrait') or (w >= h and target == 'landscape'):
+        print(name)
+" "$1")" || return 1
+  if [ -z "$candidates" ]; then
+    return 1
+  fi
+  local n; n=$(printf '%s\n' "$candidates" | grep -c .)
+  if [ "$n" -gt 1 ]; then
+    echo "warning: more than one $1 monitor detected ($(printf '%s' "$candidates" | tr '\n' ' ')); using the first" >&2
+    echo "         to choose another, pass its name: wp <h|v> <n> <MONITOR>" >&2
+  fi
+  printf '%s\n' "$candidates" | head -n1
+}
+
+# Check that the monitor requested by name exists, is enabled and has the
+# expected orientation. Without this, `wp h 5 DP-9` would write an override for
+# a nonexistent monitor without complaining.
+validate_monitor() {  # $1 = name, $2 = portrait|landscape
+  local name="$1" target="$2"
+  command -v hyprctl >/dev/null 2>&1 || { echo "error: hyprctl not found (is Hyprland running?)" >&2; return 1; }
+  hyprctl monitors -j | python3 -c "
+import sys, json
+
+name, target = sys.argv[1], sys.argv[2]
+raw = sys.stdin.read()
+if not raw.strip():
+    sys.exit(1)
+try:
+    monitors = json.loads(raw)
+except ValueError:
+    sys.exit(1)
+if not isinstance(monitors, list):
+    sys.exit(1)
+
+for m in monitors:
+    if not isinstance(m, dict) or m.get('name') != name:
+        continue
+    if m.get('disabled'):
+        print(f'error: monitor {name} is disabled', file=sys.stderr)
+        sys.exit(1)
+    w = m.get('width')
+    h = m.get('height')
+    if not isinstance(w, int) or not isinstance(h, int):
+        # Without dimensions the orientation cannot be checked; accept it,
+        # since the user named the monitor explicitly.
+        sys.exit(0)
+    t = m.get('transform', 0)
+    if not isinstance(t, int):
+        t = 0
+    w, h = (h, w) if t % 2 else (w, h)
+    actual = 'portrait' if h > w else 'landscape'
+    if actual != target:
+        print(f'error: monitor {name} is {actual}, not {target}', file=sys.stderr)
+        sys.exit(1)
+    sys.exit(0)
+
+print(f'error: monitor {name} not found in hyprctl monitors', file=sys.stderr)
+sys.exit(1)
+" "$name" "$target"
+}
+
+list_catalogue() { # $1 = directory, $2 = label
+  local d="$R/$1" i=1 f
+  [ -d "$d" ] || { echo "  (no $1)"; return 0; }
+  echo "== $2 =="
+  local a=()
+  shopt -s nullglob
+  a=("$d"/*.png)
+  shopt -u nullglob
+  for f in "${a[@]}"; do
+    printf "  %2d. %s\n" "$i" "$(basename "${f%.png}")"
+    i=$((i+1))
+  done
+  return 0
+}
+
+apply() { # $1 = 16x9|9x16, $2 = index, $3 = portrait|landscape, $4 = monitor (optional)
+  local d="$R/$1" n="$2" target="$3" mon_requested="${4:-}"
+
+  if [[ ! "$n" =~ ^[0-9]+$ ]]; then
+    echo "error: invalid number: '$n' (use a plain integer, no comma/range)" >&2
+    return 1
+  fi
+  # Explicit base 10: without it `wp h 09` blows up with "value too great for
+  # base" inside (( )), because a leading zero makes bash read it as octal.
+  n=$((10#$n))
+  if (( n < 1 )); then
+    echo "error: number $n out of range (minimum 1)" >&2
+    return 1
+  fi
+
+  local a=()
+  shopt -s nullglob
+  a=("$d"/*.png)
+  shopt -u nullglob
+
+  if (( ${#a[@]} == 0 )); then
+    echo "error: no art found in $d" >&2
+    return 1
+  fi
+  if (( n > ${#a[@]} )); then
+    echo "error: number $n outside 1..${#a[@]}" >&2
+    return 1
+  fi
+  local f="${a[n-1]}"
+
+  local mon
+  if [ -n "$mon_requested" ]; then
+    if [[ ! "$mon_requested" =~ $MONITOR_RE ]]; then
+      echo "error: invalid monitor name: '$mon_requested'" >&2
+      return 1
+    fi
+    validate_monitor "$mon_requested" "$target" || return 1
+    mon="$mon_requested"
+  else
+    mon=$(mon_by_orientation "$target") || { echo "error: could not detect a $target monitor (check hyprctl)" >&2; return 1; }
+    if [ -z "$mon" ]; then
+      echo "error: no $target monitor detected" >&2
+      return 1
+    fi
+    if [[ ! "$mon" =~ $MONITOR_RE ]]; then
+      echo "error: hyprctl reported an unexpected monitor name: '$mon'" >&2
+      return 1
+    fi
+  fi
+
+  # Propagate the CLI's exit code: swallowing it made `wp` exit 0 even when
+  # nothing had been written.
+  "$CLI" set "$mon" "$f"
+}
+
+usage() {
+  cat <<'EOF'
+usage: wp                    list both catalogues
+       wp h <n> [MONITOR]    apply the nth landscape image
+       wp v <n> [MONITOR]    apply the nth portrait image
+       wp h | wp v           list the matching catalogue only
+
+MONITOR is optional: by default wp picks the first monitor with the requested
+orientation. Pass its name (as shown by `hyprctl monitors`) when more than one
+monitor shares that orientation. E.g.: wp h 5 DP-3
+EOF
+}
+
+rc=0
+case "${1:-}" in
+  # The Portuguese aliases (horizontal/deitada, vertical/pe) predate the switch
+  # to English and stay accepted: they are muscle memory. English names are
+  # accepted too.
+  h|horizontal|deitada|landscape)
+    # Explicit if/then/else: with `A && B || C`, a failure in apply fell into
+    # the `||` and printed the catalogue with no error on screen at all -- the
+    # user saw the list and assumed it had worked.
+    if [ $# -ge 2 ]; then
+      apply 16x9 "$2" landscape "${3:-}" || rc=$?
+    else
+      list_catalogue 16x9 "LANDSCAPE (horizontal monitor)" || rc=$?
+    fi
+    ;;
+  v|vertical|pe|portrait)
+    if [ $# -ge 2 ]; then
+      apply 9x16 "$2" portrait "${3:-}" || rc=$?
+    else
+      list_catalogue 9x16 "PORTRAIT (vertical monitor)" || rc=$?
+    fi
+    ;;
+  ""|list|-l)
+    list_catalogue 16x9 "LANDSCAPE (horizontal monitor)" || rc=$?
+    echo
+    list_catalogue 9x16 "PORTRAIT (vertical monitor)" || rc=$?
+    echo
+    usage
+    ;;
+  -h|--help|help)
+    usage
+    ;;
+  *)
+    usage >&2
+    rc=1
+    ;;
+esac
+
+exit "$rc"

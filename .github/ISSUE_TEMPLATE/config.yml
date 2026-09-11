@@ -1,0 +1,8 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Security issue
+    url: https://github.com/vitorcanoas/omarchy-wallpaper-per-monitor/blob/main/.github/SECURITY.md
+    about: Please report security issues privately, following SECURITY.md — not as a public issue.
+  - name: Omarchy itself
+    url: https://github.com/omacom/omarchy/issues
+    about: For bugs in Omarchy or its shell rather than in this plugin.

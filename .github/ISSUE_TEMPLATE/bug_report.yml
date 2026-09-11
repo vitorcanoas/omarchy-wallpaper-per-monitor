@@ -1,0 +1,125 @@
+name: Bug report
+description: Something in the plugin behaves incorrectly on your setup.
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting. This plugin has only ever been validated on one
+        machine (two monitors, one rotated), so reports from other setups are
+        the most useful thing you can send.
+
+        Please fill in the monitor and log sections — on a wallpaper bug they
+        are almost always what identifies the cause.
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What you saw, and what you expected instead.
+      placeholder: |
+        The rotated monitor shows the landscape wallpaper stretched sideways
+        instead of the portrait one.
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. wallpaper-monitor set HDMI-A-1 ~/Pictures/portrait.png
+        2. omarchy restart shell
+        3. The rotated screen shows ...
+    validations:
+      required: true
+
+  - type: input
+    id: omarchy-version
+    attributes:
+      label: Omarchy version
+      description: "Output of `omarchy version`, or the contents of `/usr/share/omarchy/version`."
+      placeholder: "4.0.2"
+    validations:
+      required: true
+
+  - type: input
+    id: quickshell-version
+    attributes:
+      label: Quickshell version
+      description: "Output of `quickshell --version`."
+      placeholder: "quickshell 0.2.0"
+    validations:
+      required: true
+
+  - type: input
+    id: plugin-version
+    attributes:
+      label: Plugin version
+      description: "The `version` field in `manifest.json`, or the commit you installed from."
+      placeholder: "0.2.0"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: rotated
+    attributes:
+      label: Is any monitor rotated?
+      description: >-
+        Rotation is the hard case in this plugin, and the one most likely to be
+        the cause. A physically rotated panel still reports its unrotated mode,
+        so `transform` is what decides orientation.
+      options:
+        - "Yes, at least one monitor is rotated (transform 1, 3, 5 or 7)"
+        - "No, all monitors are unrotated (transform 0)"
+        - "I do not know"
+    validations:
+      required: true
+
+  - type: textarea
+    id: monitors
+    attributes:
+      label: Monitor layout
+      description: >-
+        Output of `hyprctl monitors -j`. Please keep the `name`, `width`,
+        `height`, `transform` and `scale` fields — `transform` is essential,
+        since a rotated panel reports its physical mode, not what is on screen.
+      render: json
+      placeholder: "$ hyprctl monitors -j"
+    validations:
+      required: true
+
+  - type: textarea
+    id: config
+    attributes:
+      label: Plugin configuration
+      description: >-
+        Output of `wallpaper-monitor list`. This shows the resolved wallpaper
+        per monitor and which precedence step each one came from.
+      render: shell
+      placeholder: "$ wallpaper-monitor list"
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Shell log
+      description: >-
+        Output of `journalctl -t omarchy-shell -n 200`, covering a shell
+        restart if you can. Note: `journalctl --user -u omarchy-shell` returns
+        nothing on this setup — use `-t` as shown, not `-u`.
+      render: shell
+      placeholder: "$ journalctl -t omarchy-shell -n 200"
+    validations:
+      required: true
+
+  - type: textarea
+    id: extra
+    attributes:
+      label: Anything else
+      description: >-
+        Screenshots or a photo of the screens, other wallpaper tools installed
+        (hyprpaper, swww), or anything else you think is relevant.
+    validations:
+      required: false

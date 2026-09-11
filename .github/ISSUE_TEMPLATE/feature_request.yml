@@ -1,0 +1,52 @@
+name: Feature request
+description: Suggest a capability or change to this plugin.
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        This is a solo-maintained, beta plugin with a deliberately narrow
+        scope: per-monitor wallpaper, chosen by effective post-rotation
+        orientation. Suggestions that fit that scope are much more likely to
+        happen than ones that broaden it.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: The problem
+      description: What are you trying to do that you cannot do today?
+      placeholder: >-
+        I dock and undock a laptop, so the monitor set changes mid-session and
+        the overrides no longer match.
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: What you would like to happen
+      description: >-
+        Describe the behaviour you want. If it affects the CLI or the config
+        file, sketch the command or the JSON you have in mind.
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives you have considered
+      description: >-
+        Including whether an existing feature almost does this — a per-monitor
+        override by name often covers what looks like a missing feature.
+    validations:
+      required: false
+
+  - type: textarea
+    id: setup
+    attributes:
+      label: Your setup
+      description: >-
+        Monitor count, orientations and `transform` values, if the request
+        depends on them. `hyprctl monitors -j` is ideal.
+    validations:
+      required: false
