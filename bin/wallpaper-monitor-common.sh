@@ -12,7 +12,7 @@
 # no runtime self-check for it. The three directly-executed CLIs keep an
 # ABSOLUTE shebang -- `#!/usr/bin/bash`, not `#!/usr/bin/env bash` and not
 # `#!/bin/bash`: see the merged-/usr note in section 3 below. Background.qml
-# already pins /usr/bin/bash (line 230), so /usr/bin/bash is the spelling the
+# already pins /usr/bin/bash, so /usr/bin/bash is the spelling the
 # whole plugin agrees on.
 #
 # WHY IT EXISTS
@@ -35,9 +35,10 @@
 # HOW THE FIVE SCRIPTS BOOTSTRAP INTO IT (builtins only -- copy verbatim)
 # ----------------------------------------------------------------------
 # The bootstrap cannot call an external tool, because finding the tools is the
-# very thing it is bootstrapping: `readlink -f`, which bin/wp:19 and
-# bin/wallpaper-monitor-menu:30 use today, is itself PATH-resolved and runs
-# before any hardening exists. So the bootstrap is pure bash -- `[[ -f ]]`,
+# very thing it is bootstrapping: `readlink -f`, which bin/wp and
+# bin/wallpaper-monitor-menu used to call to find themselves, is itself
+# PATH-resolved and ran before any hardening existed. So the bootstrap is pure
+# bash -- `[[ -f ]]`,
 # `[[ -L ]]`, `[[ -r ]]`, `[[ -O ]]`, `cd -P`, `pwd -P` and parameter
 # expansion -- and nothing else:
 #
@@ -130,18 +131,51 @@ set -uo pipefail
 
 # SHELLOPTS and BASHOPTS are read-only in a running bash, so `unset` cannot
 # remove them; they were consumed at startup, before this file existed. What
-# is still reachable is the options they switched on, so switch the dangerous
-# ones back off explicitly. (`allexport` would export every later assignment
-# into every child; `xtrace`/`verbose` would spray the user's config contents
-# into whatever log the caller is teeing; `noglob` and `noclobber` change the
-# meaning of code written without them.)
+# is still reachable is the options they switched on, so switch them back off
+# explicitly.
+#
+# The `set -o` half: `allexport` would export every later assignment into every
+# child; `xtrace`/`verbose` would spray the user's config contents into
+# whatever log the caller is teeing; `noglob` and `noclobber` change the
+# meaning of code written without them.
 unset -v SHELLOPTS BASHOPTS 2>/dev/null || true
 set +o allexport +o xtrace +o verbose +o noclobber +f
-shopt -u expand_aliases
+
+# The `shopt` half. BASHOPTS carries shell options too, and an earlier version
+# of this file cleared only `expand_aliases` -- which left every OTHER option
+# an attacker can deliver through BASHOPTS switched on. That gap was
+# demonstrable: `env -i BASHOPTS=nocasematch:extglob:nullglob:globstar:xpg_echo
+# ...` reached this point with all of them still ON, and `[[ ABC =~ ^abc$ ]]`
+# and `case ABC in abc)` both MATCHED -- an inversion of the exact pattern
+# semantics the monitor-name regex and the extension allowlist rely on.
+#
+#   expand_aliases  turns a name into someone else's command.
+#   nocasematch     case-folds `[[ =~ ]]`, `[[ == ]]` and `case`.
+#   nocaseglob      case-folds pathname expansion.
+#   nullglob        an unmatched glob vanishes instead of staying literal, so a
+#                   command silently runs with one fewer argument.
+#   failglob        an unmatched glob is a hard error instead.
+#   dotglob         quietly pulls dotfiles into every `*`.
+#   globstar        makes `**` recurse a whole tree.
+#   extglob         changes what a pattern MEANS: `!(x)`, `@(a|b)`, `+(a)`.
+#   xpg_echo        makes `echo` interpret backslash escapes, so a filename
+#                   containing a backslash-n forges a line in our own output.
+#
+# `globasciiranges` is the opposite case -- ON is the safe state, because it
+# makes `[A-Za-z0-9._:-]` mean ASCII rather than whatever the collation says --
+# so it is switched ON rather than off. Each name is applied with its own
+# `shopt`, so an option a given bash build does not know is skipped instead of
+# aborting the loop or leaving a non-zero status behind.
+for _wpm_opt in expand_aliases nocasematch nocaseglob nullglob failglob \
+                dotglob globstar extglob xpg_echo; do
+  shopt -u "$_wpm_opt" 2>/dev/null || true
+done
+unset -v _wpm_opt
+shopt -s globasciiranges 2>/dev/null || true
 PS4='+ '
 
 # --- 2. Environment sanitization -----------------------------------------
-# INVENTORY section A.4 found NO sanitization anywhere in the five scripts:
+# Before this preamble existed, none of the five scripts sanitized anything:
 # not PATH, not IFS, not BASH_ENV, not ENV, not LD_PRELOAD, not
 # LD_LIBRARY_PATH, not CDPATH, not SHELLOPTS, not GLOBIGNORE. Every name below
 # changes what a later command does without appearing at that command's call
@@ -177,17 +211,17 @@ unset -v CDPATH GLOBIGNORE BASH_ENV ENV LD_PRELOAD LD_LIBRARY_PATH LD_AUDIT \
 # hypothetical non-merged-/usr system; on Arch it is a symlink to usr/bin and
 # resolves to the same directory.
 #
-# LC_ALL=C / LANG=C subsume the hand-rolled `export LC_ALL=C` at bin/wp:17 and
-# bin/wallpaper-monitor-menu:28 -- same value, so catalogue glob ordering is
-# unchanged -- and extend the same pin to bin/wallpaper-monitor, which only
-# ever scoped it to one `sleep` (line 139).
+# LC_ALL=C / LANG=C subsume the hand-rolled `export LC_ALL=C` that bin/wp and
+# bin/wallpaper-monitor-menu each carried -- same value, so catalogue glob
+# ordering is unchanged -- and extend the same pin to bin/wallpaper-monitor,
+# which only ever scoped it to its lock-retry `sleep`.
 export PATH=/usr/bin:/bin
 export LC_ALL=C
 export LANG=C
 
 # NO umask is set here, deliberately. bin/wallpaper-monitor already picks one
-# per operation -- `umask 022` around the config write (line 168), `umask 077`
-# around the lock directories (lines 98, 110) -- and a global umask in this
+# per operation -- `umask 022` around the config write, `umask 077` around the
+# lock directories -- and a global umask in this
 # file would change the mode of files those subshells create.
 
 # Drop any cached command lookups made before PATH was pinned.
@@ -237,46 +271,61 @@ fi
 export WPM_PROGNAME
 
 # --- 4. Constants ---------------------------------------------------------
-WPM_PLUGIN_ID="vitorcanoas.background-per-monitor"   # install.sh:50, uninstall.sh:45
-WPM_NATIVE_PLUGIN_ID="omarchy.background"            # install.sh:51, uninstall.sh:46
+# NOTE: the plugin id and the native-plugin id are NOT declared here. They are
+# used only by install.sh and uninstall.sh, which declare their own, and a
+# second copy in this file would be a constant with no consumer that could
+# silently drift out of step with the two that are real.
 
-# The self-referencing CLI. INVENTORY A.2 flags bin/wp:21 and
-# bin/wallpaper-monitor-menu:37, where CLI falls back to the BARE STRING
-# "wallpaper-monitor" when the sibling is not executable -- a PATH-resolved
-# child process, used at bin/wp:280 and `exec`'d at bin/wallpaper-monitor-menu:391.
-# The sibling's absolute path is known here, so the bare-name fallback can go.
+# The self-referencing CLI. bin/wp and bin/wallpaper-monitor-menu each used to
+# fall back to the BARE STRING "wallpaper-monitor" when the sibling was not
+# executable -- a PATH-resolved child process, run by `wp` and `exec`'d by the
+# menu. The sibling's absolute path is known here, so the bare-name fallback
+# can go.
 WPM_CLI="$WPM_BIN_DIR/wallpaper-monitor"
 
 # Read budget for every config read. 262144 = the helper's own MAX_FILE_BYTES,
 # which --max-bytes may only lower, never raise. It replaces four inconsistent
-# copies of a 1 MiB literal (bin/wallpaper-monitor:185, bin/wp:57,
-# bin/wallpaper-monitor-menu:75 and :237), three of which were declared next to
-# an unbounded read that never enforced them.
+# copies of a 1 MiB literal -- one in bin/wallpaper-monitor, one in bin/wp and
+# two in bin/wallpaper-monitor-menu -- three of which were declared next to an
+# unbounded read that never enforced them.
 WPM_MAX_CONFIG_BYTES=262144
 
-# Caps for the two bounded command substitutions F5 names (section 6.4 of the
-# design). Both are about two orders of magnitude above observed output, and
-# going over is a loud failure, never a silent truncation.
-WPM_MAX_HYPRCTL_BYTES=65536   # bin/wallpaper-monitor:611 `hyprctl monitors -j`
-WPM_MAX_FILE_BYTES=256        # bin/wallpaper-monitor:379 `file -b --mime-type`
+# Caps for the bounded command substitutions finding 5 names. Both are about
+# two orders of magnitude above observed output, and going over is a loud
+# failure, never a silent truncation.
+#
+# WPM_MAX_HYPRCTL_BYTES serves FOUR `hyprctl monitors -j` call sites, not one:
+#   bin/wallpaper-monitor       cmd_list, the "Detected monitors" section
+#   bin/wp                      mon_by_orientation and validate_monitor
+#   bin/wallpaper-monitor-menu  list_monitors
+# All four go through wpm_bounded. An earlier pass bounded only the first and
+# treated the other three as out of scope; they were not, and a flooding
+# hyprctl drove bin/wp and the menu to multi-gigabyte RSS and never returned.
+WPM_MAX_HYPRCTL_BYTES=65536   # `hyprctl monitors -j`  -- 4 call sites
+WPM_MAX_FILE_BYTES=256        # `file -b --mime-type`  -- 1 call site, in
+                              # bin/wallpaper-monitor resolve_image
 
-# Monitor-name shape, unified from the two existing copies (bin/wp:112 and
-# bin/wallpaper-monitor-menu:44, plus the inline literal at
-# bin/wallpaper-monitor:360). Byte-identical to what those three use today.
+# Monitor-name shape, unified from the two existing copies (in bin/wp and
+# bin/wallpaper-monitor-menu, plus the inline literal in
+# bin/wallpaper-monitor). Byte-identical to what those three used before.
+#
+# WPM_MAX_MONITORS and WPM_MAX_MONITOR_NAME_BYTES bound what HYPRCTL reports,
+# where the producer is untrusted: they are applied while parsing
+# `hyprctl monitors -j`, never to an argument the user typed.
 WPM_MONITOR_RE='^[A-Za-z0-9._:-]+$'
 WPM_MAX_MONITORS=64
 WPM_MAX_MONITOR_NAME_BYTES=64
 
-readonly WPM_PLUGIN_ID WPM_NATIVE_PLUGIN_ID WPM_CLI WPM_MAX_CONFIG_BYTES \
+readonly WPM_CLI WPM_MAX_CONFIG_BYTES \
          WPM_MAX_HYPRCTL_BYTES WPM_MAX_FILE_BYTES WPM_MONITOR_RE \
          WPM_MAX_MONITORS WPM_MAX_MONITOR_NAME_BYTES
-export WPM_PLUGIN_ID WPM_NATIVE_PLUGIN_ID WPM_CLI WPM_MAX_CONFIG_BYTES \
+export WPM_CLI WPM_MAX_CONFIG_BYTES \
        WPM_MAX_HYPRCTL_BYTES WPM_MAX_FILE_BYTES WPM_MONITOR_RE \
        WPM_MAX_MONITORS WPM_MAX_MONITOR_NAME_BYTES
 
 # The payload allowlist: `path:mode`, one entry per installed file. It replaces
-# the `rsync --include` list at install.sh:234-246 AND the `chmod +x` at :247,
-# so the executable bit travels with the entry instead of being a second list
+# install.sh's `rsync --include` list AND the `chmod +x` that followed it, so
+# the executable bit travels with the entry instead of being a second list
 # that can drift out of sync. It is also the `--keep` list for `prune-dir`, so
 # the copy and the delete cannot disagree about what belongs in the plugin
 # directory. Fail-closed semantics are preserved exactly: a file not named here
@@ -309,9 +358,9 @@ readonly WPM_PAYLOAD
 #
 # ORDERING DECISION -- /bin/... ENTRIES ARE DELIBERATELY ABSENT
 # -------------------------------------------------------------
-# The design's candidate lists carried a /bin/... entry beside each
-# /usr/bin/... one. Every such entry is DEAD on the target platform and was
-# removed on purpose; this paragraph exists so a reviewer does not read the
+# An obvious first cut of this table carries a /bin/... entry beside each
+# /usr/bin/... one. Every such entry is DEAD on the target platform and is
+# deliberately absent; this paragraph exists so a reviewer does not read the
 # absence as an oversight.
 #
 # Omarchy is Arch-based, and Arch is a merged-/usr distribution: /bin is a
@@ -335,7 +384,7 @@ readonly WPM_PAYLOAD
 #
 # For the same reason the three executable CLIs use `#!/usr/bin/bash`, not
 # `#!/bin/bash`: an absolute shebang through /bin would resolve fine for the
-# kernel but is the same dead spelling, and Background.qml:230 already pins
+# kernel but is the same dead spelling, and Background.qml already pins
 # /usr/bin/bash.
 #
 # A final-component symlink is fine and expected: /usr/bin/python3 is
@@ -381,30 +430,40 @@ declare -A WPM_TOOL_CANDIDATES=(
   [OMARCHY_MENU_IMAGES]='/usr/bin/omarchy-menu-images /usr/share/omarchy/bin/omarchy-menu-images'
 )
 readonly WPM_TOOL_CANDIDATES
-# Call sites each name serves (INVENTORY section A.2), so the table can be
-# checked against the inventory line by line:
-#   PYTHON3              everything -- install.sh:338,352; uninstall.sh:189,203;
-#                        bin/wp:54,117,172; bin/wallpaper-monitor:314,336,433,
-#                        473,509,540,562,616; bin/wallpaper-monitor-menu:70,181,232
-#   JQ                   install.sh:452,664; uninstall.sh:333,335,353,410
-#   AWK                  install.sh:579,628; uninstall.sh:258
-#   GREP                 install.sh:569; uninstall.sh:222,230; bin/wp:158
-#   SED                  install.sh:667 (DRY_RUN preview only, 3 uses on one line)
-#   TR                   bin/wp:160
-#   HEAD                 bin/wp:163 (`head -n1`)
-#   MKTEMP               install.sh:128,385,613; uninstall.sh:78,254,346 --
-#                        after migration only the DRY_RUN staging directory
-#                        still needs it; the transaction temporaries are the
-#                        helper's own O_EXCL|O_NOFOLLOW files
-#   SLEEP                bin/wallpaper-monitor:139 (lock retry)
-#   REALPATH             bin/wallpaper-monitor:371 (`realpath -m --`, unchanged)
-#   FILE                 bin/wallpaper-monitor:379 -- OPTIONAL, falls back to
-#                        the extension allowlist at 391-398
-#   HYPRCTL              bin/wp:117,172; bin/wallpaper-monitor:611 -- OPTIONAL
-#   OMARCHY              install.sh:176 (required)
-#   OMARCHY_SHELL        install.sh:187 (optional, warn only)
-#   OMARCHY_MENU_SELECT  bin/wallpaper-monitor-menu:338
-#   OMARCHY_MENU_IMAGES  bin/wallpaper-monitor-menu:381
+# What each name is for. Deliberately named by FUNCTION rather than by line
+# number: line numbers into these files go stale on the next edit, and a stale
+# pointer is worse than none -- the omission of bin/wallpaper-monitor-menu from
+# an earlier version of this list is exactly why its `hyprctl monitors -j` was
+# left unbounded through three review rounds.
+#   PYTHON3              everything: the helper runs inside it, and every
+#                        JSON filter in the three CLIs is a `python3 -I` child
+#   JQ                   install.sh / uninstall.sh, shell.json editing
+#   AWK                  install.sh / uninstall.sh, menu-block editing
+#   GREP                 install.sh / uninstall.sh; bin/wp mon_by_orientation
+#                        (counting candidate monitors)
+#   SED                  install.sh, DRY_RUN preview only
+#   TR                   bin/wp mon_by_orientation (newlines -> spaces in the
+#                        multi-monitor warning)
+#   HEAD                 bin/wp mon_by_orientation (`head -n1`)
+#   MKTEMP               install.sh / uninstall.sh -- after the migration only
+#                        the DRY_RUN staging directory still needs it; the
+#                        transaction temporaries are the helper's own
+#                        O_EXCL|O_NOFOLLOW files
+#   SLEEP                bin/wallpaper-monitor, lock retry
+#   REALPATH             bin/wallpaper-monitor resolve_image (`realpath -m --`)
+#   FILE                 bin/wallpaper-monitor resolve_image -- OPTIONAL, falls
+#                        back to the extension allowlist. Bounded by
+#                        WPM_MAX_FILE_BYTES through wpm_bounded.
+#   HYPRCTL              OPTIONAL, and FOUR call sites, every one of them
+#                        bounded by WPM_MAX_HYPRCTL_BYTES through wpm_bounded:
+#                          bin/wallpaper-monitor       cmd_list
+#                          bin/wp                      mon_by_orientation
+#                          bin/wp                      validate_monitor
+#                          bin/wallpaper-monitor-menu  list_monitors
+#   OMARCHY              install.sh (required)
+#   OMARCHY_SHELL        install.sh (optional, warn only)
+#   OMARCHY_MENU_SELECT  bin/wallpaper-monitor-menu, the monitor picker
+#   OMARCHY_MENU_IMAGES  bin/wallpaper-monitor-menu, the image picker
 
 # Names already resolved, so wpm_require is idempotent and a second call does
 # not try to reassign a readonly variable.
@@ -437,7 +496,8 @@ wpm_cfg() {
 }
 
 # Map the helper's exit code onto this plugin's existing, unchanged codes
-# (bin/wallpaper-monitor:34-35: EXIT_UNREADABLE=2, EXIT_LOCK=3; usage is 1).
+# (bin/wallpaper-monitor declares EXIT_UNREADABLE=2 and EXIT_LOCK=3; usage
+# is 1).
 # No user-visible exit code changes as a result of the migration.
 #
 #   0        success                                     -> return 0
@@ -588,11 +648,12 @@ wpm_require() {
 # wpm_optional TOOL...
 #   Same resolution, but an unresolvable tool leaves the variable EMPTY and
 #   returns 0. This is what preserves today's graceful degradation: `file`
-#   falls back to the extension allowlist (bin/wallpaper-monitor:391-398),
-#   `hyprctl` makes `list` print "(hyprctl not found)" (:659), and a missing
-#   omarchy-shell is a warning rather than an aborted install
-#   (install.sh:187-194). Callers test `[[ -n $FILE ]]` exactly where they test
-#   `command -v file` today.
+#   falls back to bin/wallpaper-monitor's extension allowlist, a missing
+#   `hyprctl` makes `list` print "(hyprctl not found)" and makes bin/wp and
+#   bin/wallpaper-monitor-menu print their own one-line "hyprctl not found"
+#   error and fail, and a missing omarchy-shell is a warning rather than an
+#   aborted install. Callers test `[[ -n $FILE ]]` exactly where they used to
+#   test `command -v file`.
 #
 #   A candidate that EXISTS but fails validation is still fatal here, and that
 #   is intended: "absent" is a supported configuration, "present but owned by
@@ -606,12 +667,18 @@ wpm_optional() {
 #   child's stdout; returns non-zero if the child failed, exceeded MAX bytes,
 #   or exceeded the deadline. Nothing is printed on failure.
 #
-#   F5's two call sites:
-#     wpm_bounded "$WPM_MAX_HYPRCTL_BYTES" 5 -- "$HYPRCTL" monitors -j
-#     wpm_bounded "$WPM_MAX_FILE_BYTES"    5 -- "$FILE" -b --mime-type -- "$img"
+#   The five call sites finding 5's defect class covers -- FOUR `hyprctl` and
+#   one `file`, all with the same 5 s deadline:
+#     bin/wallpaper-monitor      cmd_list
+#     bin/wp                     mon_by_orientation
+#     bin/wp                     validate_monitor
+#     bin/wallpaper-monitor-menu list_monitors
+#       wpm_bounded "$WPM_MAX_HYPRCTL_BYTES" 5 -- "$HYPRCTL" monitors -j
+#     bin/wallpaper-monitor      resolve_image
+#       wpm_bounded "$WPM_MAX_FILE_BYTES"    5 -- "$FILE" -b --mime-type -- "$img"
 #
 #   IMPLEMENTATION NOTE -- this is NOT `timeout ... | head -c`.
-#   The design sketched it as a port of the reference's bounded_busctl(), i.e.
+#   The obvious sketch is a port of the reference's bounded_busctl(), i.e.
 #   `timeout --foreground` piped into `head -c $((MAX+1))`. That shape is
 #   consumer-side bounding, which the moderator rejected on the QML side for a
 #   reason that applies identically here: by the time `head` truncates, the
@@ -660,9 +727,9 @@ wpm_bounded() {
 # PYTHON3 must exist before anything else can be validated, since check-tool
 # runs inside it. Resolving it here rather than in each script means a machine
 # without python3 fails at the FIRST line of the install instead of halfway
-# through, after shell.json has already been touched (install.sh:338 shells out
-# to python3 today with no presence check at all, even though README.md:52
-# already lists it as a dependency).
+# through, after shell.json has already been touched (install.sh used to shell
+# out to python3 with no presence check at all, even though README.md already
+# lists it as a dependency).
 #
 # The check-tool call below validates /usr/bin/python3 itself -- regular file,
 # root-owned, not group/other-writable, every parent clean, symlink chain

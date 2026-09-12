@@ -10,7 +10,7 @@
 #
 # SHEBANG: absolute, and `/usr/bin/bash` rather than `/bin/bash` -- on Arch
 # /bin is a SYMLINK to usr/bin, which the helper's per-component no-follow
-# walk correctly refuses. Background.qml:230 pins the same spelling.
+# walk correctly refuses. Background.qml pins the same spelling.
 set -uo pipefail
 
 # --- Closed-environment bootstrap (copied verbatim from the preamble) -----
@@ -170,12 +170,39 @@ mon_by_orientation() {  # $1 = portrait|landscape
   wpm_optional HYPRCTL
   [[ -n $HYPRCTL ]] || { echo "error: hyprctl not found (is Hyprland running?)" >&2; return 1; }
   wpm_require GREP TR HEAD
+
+  # Finding 5: `$("$HYPRCTL" monitors -j | ...)` was a consumer-side command
+  # substitution with no cap, no deadline and no supervision. A hyprctl that
+  # floods stdout was buffered into this shell until the OOM killer or the
+  # user intervened -- measured at 6.0 GB resident and still climbing, the
+  # command never returning -- and a hyprctl that simply never closed stdout
+  # hung `wp h 1` forever. wpm_bounded runs it in its own session with the cap
+  # enforced as bytes ARRIVE and a 5 s deadline, and tears the whole process
+  # group down (TERM -> grace -> KILL -> waitpid) on a breach.
+  #
+  # FALLBACK BEHAVIOUR IS UNCHANGED: every producer failure still ends in
+  # `return 1`, which is exactly what the old pipeline did under pipefail, and
+  # the caller still prints "could not detect a <orientation> monitor (check
+  # hyprctl)". The only new output is a LOUD line when the cap or the deadline
+  # is what failed, so an over-budget answer can never be quietly mistaken for
+  # "no monitor has that orientation".
+  local raw="" hrc=0
+  raw="$(wpm_bounded "$WPM_MAX_HYPRCTL_BYTES" 5 -- "$HYPRCTL" monitors -j)" || hrc=$?
+  if (( hrc == 6 || hrc == 7 )); then
+    echo "error: hyprctl monitors -j exceeded ${WPM_MAX_HYPRCTL_BYTES} bytes or 5s" >&2
+    echo "       refusing to parse a partial answer" >&2
+    return 1
+  elif (( hrc != 0 )); then
+    return 1
+  fi
+
   local candidates
-  candidates="$("$HYPRCTL" monitors -j | "$PYTHON3" -I -c "
+  # JSON via argv, not stdin: with a heredoc, python's stdin would be the
+  # script itself. It is bounded now, so argv cannot grow towards ARG_MAX.
+  candidates="$("$PYTHON3" -I - "$raw" "$1" <<'PYEOF'
 import sys, json
 
-target = sys.argv[1]
-raw = sys.stdin.read()
+raw, target = sys.argv[1], sys.argv[2]
 if not raw.strip():
     sys.exit(0)
 try:
@@ -208,7 +235,8 @@ for m in monitors:
     w, h = (h, w) if t % 2 else (w, h)
     if (h > w and target == 'portrait') or (w >= h and target == 'landscape'):
         print(name)
-" "$1")" || return 1
+PYEOF
+)" || return 1
   if [ -z "$candidates" ]; then
     return 1
   fi
@@ -227,11 +255,28 @@ validate_monitor() {  # $1 = name, $2 = portrait|landscape
   local name="$1" target="$2"
   wpm_optional HYPRCTL
   [[ -n $HYPRCTL ]] || { echo "error: hyprctl not found (is Hyprland running?)" >&2; return 1; }
-  "$HYPRCTL" monitors -j | "$PYTHON3" -I -c "
+
+  # Same finding-5 treatment as mon_by_orientation above, and the same
+  # preserved fallback: any producer failure still leaves this function
+  # returning non-zero, which the caller turns into `return 1` without a
+  # message of its own -- exactly what the unbounded pipeline did under
+  # pipefail. Only the cap/deadline breach is newly loud, because a truncated
+  # monitor list would otherwise make a real monitor look like it "was not
+  # found in hyprctl monitors" and send the user hunting for the wrong bug.
+  local raw="" hrc=0
+  raw="$(wpm_bounded "$WPM_MAX_HYPRCTL_BYTES" 5 -- "$HYPRCTL" monitors -j)" || hrc=$?
+  if (( hrc == 6 || hrc == 7 )); then
+    echo "error: hyprctl monitors -j exceeded ${WPM_MAX_HYPRCTL_BYTES} bytes or 5s" >&2
+    echo "       refusing to parse a partial answer" >&2
+    return 1
+  elif (( hrc != 0 )); then
+    return 1
+  fi
+
+  "$PYTHON3" -I - "$raw" "$name" "$target" <<'PYEOF'
 import sys, json
 
-name, target = sys.argv[1], sys.argv[2]
-raw = sys.stdin.read()
+raw, name, target = sys.argv[1], sys.argv[2], sys.argv[3]
 if not raw.strip():
     sys.exit(1)
 try:
@@ -265,7 +310,7 @@ for m in monitors:
 
 print(f'error: monitor {name} not found in hyprctl monitors', file=sys.stderr)
 sys.exit(1)
-" "$name" "$target"
+PYEOF
 }
 
 list_catalogue() { # $1 = directory, $2 = label

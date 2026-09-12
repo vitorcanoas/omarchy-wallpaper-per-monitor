@@ -22,7 +22,7 @@
 #
 # SHEBANG: absolute, and `/usr/bin/bash` rather than `/bin/bash` -- on Arch
 # /bin is a SYMLINK to usr/bin, which the helper's per-component no-follow
-# walk correctly refuses. Background.qml:230 pins the same spelling.
+# walk correctly refuses. Background.qml pins the same spelling.
 
 set -uo pipefail                  # `set -e` is added after the preamble
 
@@ -229,8 +229,31 @@ list_monitors() {
     return 1
   }
 
-  local raw=""
-  raw="$("$HYPRCTL" monitors -j 2>/dev/null)" || raw=""
+  # Finding 5: this was `raw="$("$HYPRCTL" monitors -j 2>/dev/null)"` -- a
+  # consumer-side command substitution with no cap, no deadline and no
+  # supervision. A hyprctl that floods stdout was buffered into this shell
+  # until the OOM killer or the user intervened (measured at 5.2 GB resident,
+  # the menu never opening); one that never closed stdout hung the menu
+  # forever. wpm_bounded gives it its own session, a cap enforced as bytes
+  # ARRIVE, a 5 s deadline and a killpg TERM -> grace -> KILL -> waitpid
+  # teardown of the whole group.
+  #
+  # FALLBACK BEHAVIOUR IS UNCHANGED: the old code degraded QUIETLY on any
+  # hyprctl failure -- `|| raw=""` -- and so does this. An empty $raw makes the
+  # filter below exit 1, list_monitors returns 1, and the caller prints its own
+  # "could not read the monitors (hyprctl monitors -j failed)" and exits 1,
+  # exactly as before. The ONE addition is a loud line when the cap or the
+  # deadline is what failed: refusing to parse a truncated monitor list matters
+  # here because a partial parse would silently offer the user a SUBSET of
+  # their monitors as if it were all of them.
+  local raw="" hrc=0
+  raw="$(wpm_bounded "$WPM_MAX_HYPRCTL_BYTES" 5 -- "$HYPRCTL" monitors -j)" || hrc=$?
+  if (( hrc == 6 || hrc == 7 )); then
+    error "hyprctl monitors -j exceeded ${WPM_MAX_HYPRCTL_BYTES} bytes or 5s -- refusing to parse a partial answer"
+    raw=""
+  elif (( hrc != 0 )); then
+    raw=""
+  fi
 
   # JSON via argv, not stdin: with a heredoc, python's stdin would be the
   # script itself. Same care already taken in wallpaper-monitor cmd_list.

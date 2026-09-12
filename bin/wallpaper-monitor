@@ -31,7 +31,7 @@
 # SHEBANG: absolute, and `/usr/bin/bash` rather than `/bin/bash` -- on Arch
 # (Omarchy's base) /bin is a SYMLINK to usr/bin, which the helper's
 # per-component no-follow walk correctly refuses, so /usr/bin is the only
-# spelling the whole plugin can agree on. Background.qml:230 already pins it.
+# spelling the whole plugin can agree on. Background.qml already pins it.
 
 set -uo pipefail                  # `set -e` is added after the preamble; see (2)
 
@@ -121,13 +121,13 @@ EOF
 # vitorcanoas/omarchy-nightlight (commit 78d9fb4), required by the Omarchy
 # marketplace maintainer.
 #
-# NOTHING about this block's LOGIC changed in the hardening pass. The audit
-# found it byte-for-byte equivalent to the design the moderator already
-# accepted (omarchy-nightlight:155-233) -- the /tmp sticky check, the
+# NOTHING about this block's LOGIC changed in the hardening pass. It is
+# byte-for-byte the lock stack the Omarchy marketplace maintainer already
+# accepted in vitorcanoas/omarchy-nightlight -- the /tmp sticky check, the
 # post-create revalidation, the atomic mkdir and the incomplete-lock recovery
 # are all still exactly as they were. The only edits are name-to-path
-# substitutions for F1 (see lock_tools below) and two `date`/`cat` calls that
-# became bash builtins.
+# substitutions for finding 1 (see lock_tools below) and two `date`/`cat`
+# calls that became bash builtins.
 RUNTIME_DIR=""
 LOCK=""
 
@@ -528,13 +528,18 @@ PYEOF
 # appear, with no error.
 #
 # The shape comes from the preamble now (WPM_MONITOR_RE), so this file, bin/wp
-# and bin/wallpaper-monitor-menu cannot drift apart. The LENGTH cap is new:
-# the regex constrained the charset but not the size, so a megabyte of dots
-# was a valid "monitor name".
+# and bin/wallpaper-monitor-menu cannot drift apart. It is byte-for-byte the
+# pattern this function already used.
+#
+# There is deliberately NO length cap here. WPM_MAX_MONITOR_NAME_BYTES exists
+# to bound what HYPRCTL reports -- an untrusted producer, which is the defect
+# class finding 5 names -- and it is applied where that output is parsed, in
+# cmd_list. The argument to `wallpaper-monitor set` is the user's own, no
+# finding asks for it to be capped, and capping it would change what the CLI
+# accepts for no security reason.
 validate_monitor_name() {
   local monitor="$1"
-  if [[ ! "$monitor" =~ $WPM_MONITOR_RE ]] \
-     || (( ${#monitor} > WPM_MAX_MONITOR_NAME_BYTES )); then
+  if [[ ! "$monitor" =~ $WPM_MONITOR_RE ]]; then
     echo "error: invalid monitor name: $monitor" >&2
     echo "       use the connector name, as shown by 'wallpaper-monitor list'" >&2
     echo "       (letters, digits and . _ : -)" >&2
