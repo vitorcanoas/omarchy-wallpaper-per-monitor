@@ -46,10 +46,12 @@ Item {
   readonly property string home: Quickshell.env("HOME")
   readonly property string stateHome: home + "/.local/state"
   readonly property string currentBackgroundLink: stateHome + "/omarchy/current/background"
-  readonly property string perMonitorOverridePath: home + "/.config/omarchy/background-per-monitor.json"
-  // The same two paths as --root/--rel pairs. The helper splits --rel itself
-  // and opens one component at a time with O_NOFOLLOW, which is why it is
-  // given the parts instead of a single pathname to resolve in one go.
+  // Every file this component touches is named to the helper as a --root/--rel
+  // PAIR, never as one pathname. The helper splits --rel itself and opens one
+  // component at a time with O_NOFOLLOW, which is why it is given the parts
+  // instead of a single path to resolve in one go. (currentBackgroundLink
+  // above is the absolute spelling of the second pair, and it exists only to
+  // be quoted in a log line -- nothing opens it.)
   readonly property string perMonitorOverrideRel: ".config/omarchy/background-per-monitor.json"
   readonly property string currentBackgroundRel: ".local/state/omarchy/current/background"
 
@@ -105,42 +107,6 @@ Item {
       console.warn("vitorcanoas.background: failed to parse background-per-monitor.json:", e)
       root.backgroundConfig = ({})
     }
-  }
-
-  // The watcher, and ONLY the watcher.
-  //
-  // This FileView used to BE the reader: onLoaded and onLoadFailed called
-  // text() and handed it straight to loadPerMonitorOverrides(). That read
-  // follows symlinks, has no size cap and no type check, so a symlink, an
-  // oversized file or a FIFO planted at perMonitorOverridePath is read -- or
-  // waited on -- inside this keep-loaded shell process. Watching the path
-  // does not make that read safe; it only makes it happen more often.
-  //
-  // So text() is never consumed now. Every signal here is a CHANGE SIGNAL
-  // that schedules configReadProc, which reads the same file through the
-  // helper's bounded, no-follow `read`. reload() stays because it is what
-  // re-arms the watch and what makes onLoaded/onLoadFailed fire, so the
-  // trigger points are exactly the ones that already worked.
-  FileView {
-    id: perMonitorOverrideWatcher
-    path: root.perMonitorOverridePath
-    watchChanges: true
-    printErrors: false
-    onLoaded: root.scheduleConfigRead()
-    // Re-read on change (including first creation). text() being stale in the
-    // change signal itself no longer matters -- nothing downstream reads it --
-    // but reload() is what keeps the watch armed, so the round trip stays.
-    onFileChanged: reload()
-    // A missing or unreadable file is no longer decided here: the helper's
-    // --allow-missing read answers with empty output, which
-    // loadPerMonitorOverrides() already turns into {} -- the same result this
-    // handler used to produce directly.
-    onLoadFailed: root.scheduleConfigRead()
-    // FileView does not load on its own at startup -- without an explicit
-    // reload() here, onLoaded only fires on a subsequent external change,
-    // leaving backgroundConfig stuck at {} for the whole session if the
-    // JSON already existed before the shell came up.
-    Component.onCompleted: reload()
   }
 
   property string currentBackground: ""
@@ -265,13 +231,23 @@ Item {
   // A command substitution buffers its producer's stdout with no limit at
   // all, inside a service that stays loaded for the whole session, and the
   // theme variant ended its script with `&`, which detached a grandchild this
-  // process could never signal and nothing could ever reap. Both are gone.
-  // QML's direct child is now always the helper, and the helper is the
-  // supervisor: own session (--setsid), PR_SET_PDEATHSIG, a hard deadline,
-  // byte/line/line-length budgets applied PRODUCER-side before a byte is
-  // forwarded, then killpg(TERM) -> 1000 ms -> killpg(KILL) and waitpid to
-  // ECHILD. That is why QML only ever has to signal its own direct child and
-  // needs no process-group API of its own.
+  // process could never signal and nothing could ever reap.
+  //
+  // The unbounded substitution is gone outright. The QML-authored `&` is gone
+  // too -- nothing this file writes detaches anything any more. What is NOT
+  // gone, because it is not this file's to remove, is a grandchild that the
+  // picker or the setter detaches on its own account. That one is covered by
+  // a different mechanism, and only while the helper can run: QML's direct
+  // child is now always the helper, and the helper is the supervisor -- own
+  // session (--setsid), PR_SET_PDEATHSIG, a hard deadline, byte/line/
+  // line-length budgets applied PRODUCER-side before a byte is forwarded,
+  // then killpg(TERM) -> 1000 ms -> killpg(KILL) and waitpid to ECHILD. It is
+  // the killpg that reaches a self-detached grandchild, and killpg runs in
+  // the helper's SIGTERM handler, so the guarantee is exactly: QML signals
+  // its own direct child and gives that child the time to tear its group
+  // down. QML needs no process-group API of its own, but it does need never
+  // to SIGKILL the helper before its handler has run -- see
+  // Component.onDestruction.
   readonly property string envBin: "/usr/bin/env"
   readonly property string pythonBin: "/usr/bin/python3"
   readonly property string omarchyBin: "/usr/share/omarchy/bin"
@@ -424,7 +400,7 @@ Item {
   // precisely how grandchildren escape.
   //
   // Which is also why every deadline here is the HELPER's deadline plus a
-  // margin (120000/125000 and 30000/35000) rather than the other way round:
+  // margin (120000/125000 and 60000/65000) rather than the other way round:
   // the group teardown belongs to the helper, and this escalation is only the
   // backstop for a helper that is itself wedged. In that backstop case the
   // helper's own child still dies with it through PR_SET_PDEATHSIG, but a
@@ -467,7 +443,8 @@ Item {
     interval: 2000
     repeat: false
     onTriggered: {
-      var procs = [configReadProc, resolveLinkProc, bgSelectorProc, themeSelectorProc]
+      var procs = [configReadProc, configStatProc, resolveLinkProc,
+                   bgSelectorProc, themeSelectorProc]
       for (var i = 0; i < procs.length; i++) {
         if (procs[i].bpTermPending && procs[i].running) procs[i].signal(9)
         procs[i].bpTermPending = false
@@ -588,6 +565,136 @@ Item {
     }
   }
 
+  // ---- the change watcher ------------------------------------------------
+  //
+  // This was a FileView pointed at the override JSON, with watchChanges: true
+  // and reload() on completion and on every change. Removing the text()
+  // CONSUMER did not remove the READ: a loaded FileView opens the path
+  // itself, following symlinks, with no size cap and no type check, so a
+  // symlink, an oversized file or a FIFO planted at
+  // ~/.config/omarchy/background-per-monitor.json was still opened -- or
+  // blocked on -- inside this keep-loaded shell process, whether or not
+  // anything ever looked at the bytes. Watching the path never made that
+  // read safe.
+  //
+  // So QML does not open this file at all any more. The change signal is a
+  // poll of the helper's `stat`, which answers from
+  // fstatat(AT_SYMLINK_NOFOLLOW) after the same per-component O_NOFOLLOW
+  // walk from $HOME that `read` uses: it never opens the file, so it cannot
+  // be redirected by a symlink and cannot block on a FIFO. Its whole answer
+  // is compared against the previous one -- type, mode, uid, gid, size, dev,
+  // ino, nlink and mtime_ns, a superset of the mtime_ns/size/ino that could
+  // change on their own -- and any difference schedules the bounded,
+  // no-follow `read` that is already the only thing that reads content.
+  //
+  // Why a poll rather than a filesystem-watcher type: a QML type or property
+  // this Quickshell version does not have fails the WHOLE component at load,
+  // which for this file means no wallpaper at all. Timer and Process are both
+  // used by the approved reference (Panel.qml:938-940 and :968-972 for a
+  // repeating Timer, :972 for triggeredOnStart, :627 for Process.running), so
+  // this is built only out of constructs already proven in a shipped plugin.
+  //
+  // 2000 ms: this file changes only when a human runs the CLI or edits the
+  // JSON by hand, so the poll is never on a latency-critical path -- but the
+  // CLI promises the wallpaper updates without restarting the shell, and 2 s
+  // keeps that promise feeling immediate. Each tick is one short-lived helper
+  // that stats a single file and exits, and a tick is skipped outright while
+  // the previous stat or a read is still in flight, so polls can never stack
+  // up. triggeredOnStart is what replaces the FileView's
+  // Component.onCompleted: reload() -- it performs the startup read, so a
+  // JSON that already existed before the shell came up is still picked up.
+  property string configIdentity: ""
+  property bool configIdentitySeen: false
+
+  function pollConfigIdentity() {
+    if (configStatProc.running || configReadProc.running) return
+    root.bpStart(configStatProc, configStatWatchdog,
+                 root.helperEnvPrefix.concat(
+                   [root.pythonBin, "-I", "-B", root.helperPath,
+                    "stat", "--root", root.home,
+                    "--rel", root.perMonitorOverrideRel, "--allow-missing"]),
+                 // `stat` spawns nothing, so the helper has no deadline of
+                 // its own for it; this watchdog is the only one.
+                 8000)
+  }
+
+  function completeConfigStat() {
+    if (configStatProc.bpCompleted) return
+    configStatProc.bpCompleted = true
+    root.bpFinish(configStatProc, configStatWatchdog)
+    if (configStatProc.bpTimedOut || configStatProc.bpTooLarge) {
+      // The stat itself misbehaved. Decide nothing, keep the last identity,
+      // let the next tick retry -- a poll is not a verdict.
+      return
+    }
+    var identity = ""
+    if (configStatProc.bpExit === 0) {
+      identity = String(configStatProc.bpOutText || "")
+    } else if (configStatProc.bpExit === 1 || configStatProc.bpExit === 4) {
+      // The path is refused at some component, or vanished under a mode the
+      // helper will not answer for. That is still a state of the file, and
+      // it is the `read` -- not this poll -- that decides what it means for
+      // backgroundConfig, exactly as FileView.onLoadFailed used to hand over
+      // to it. Giving the failure its own identity is what stops it from
+      // scheduling a read on every tick while the state is unchanged. Real
+      // output always begins with "type=", so the two can never collide.
+      identity = "refused=" + configStatProc.bpExit
+    } else {
+      // A usage or internal error in the helper is a bug here, not a change
+      // in the file. Do not turn it into a read.
+      return
+    }
+    if (root.configIdentitySeen && identity === root.configIdentity) return
+    root.configIdentity = identity
+    root.configIdentitySeen = true
+    root.scheduleConfigRead()
+  }
+
+  Process {
+    id: configStatProc
+    property string bpOutText: ""
+    property int bpOutChars: 0
+    property int bpOutLines: 0
+    property string bpErrText: ""
+    property int bpErrChars: 0
+    property int bpErrLines: 0
+    property bool bpTooLarge: false
+    property bool bpTimedOut: false
+    property bool bpTermPending: false
+    property bool bpCompleted: false
+    property int bpExit: -1
+    // `stat` prints nine short key=value lines, and the helper's own error
+    // line is bounded by its MAX_MESSAGE_BYTES. These sit above both and far
+    // below anything that could buffer.
+    property int bpMaxChars: 4096
+    property int bpMaxLines: 16
+    property int bpMaxLineChars: 4096
+    stdout: SplitParser { onRead: function(line) { root.bpNote(configStatProc, line, false) } }
+    stderr: SplitParser { onRead: function(line) { root.bpNote(configStatProc, line, true) } }
+    onExited: function(exitCode) {
+      configStatProc.bpExit = exitCode
+      Qt.callLater(root.completeConfigStat)
+    }
+  }
+
+  Timer {
+    id: configStatWatchdog
+    interval: 8000
+    repeat: false
+    onTriggered: {
+      if (!root.bpWatchdogFired(configStatProc, configStatWatchdog)) root.completeConfigStat()
+    }
+  }
+
+  Timer {
+    id: configWatchTimer
+    interval: 2000
+    repeat: true
+    running: true
+    triggeredOnStart: true
+    onTriggered: root.pollConfigIdentity()
+  }
+
   // ---- the current-background link ---------------------------------------
   //
   // Was /usr/bin/readlink -f behind a StdioCollector. `resolve-link` answers
@@ -658,7 +765,24 @@ Item {
     proc.bpStage = 1
     // 120 s for a human at a picker; the byte budget is the continuously
     // enforced control and the deadline is only the backstop.
-    root.bpStart(proc, watchdog, root.selectorRunArgv(120000, [pickerPath]), 125000)
+    //
+    // Stage 1's answer is CONSUMED, and selectorChoice() accepts exactly one
+    // printable absolute line, so the budget IS the shape of the answer:
+    // 4 lines, 4096 bytes. Anything past that is not a slow picker, it is a
+    // picker answering something this will refuse anyway.
+    root.bpSetCaps(proc, 4096, 4, 4096)
+    root.bpStart(proc, watchdog,
+                 root.selectorRunArgv(120000, 4096, 4, 4096, [pickerPath]), 125000)
+  }
+
+  // The consumer-side mirror of the helper's producer-side budget. The two
+  // stages are budgeted differently and share one Process, so the caps are
+  // assigned at each launch rather than fixed on the Process; the values on
+  // the Process declarations are the stage-1 ones it starts life with.
+  function bpSetCaps(proc, maxChars, maxLines, maxLineChars) {
+    proc.bpMaxChars = maxChars
+    proc.bpMaxLines = maxLines
+    proc.bpMaxLineChars = maxLineChars
   }
 
   // The helper's `run` is the supervisor. --setsid gives the picker its own
@@ -673,15 +797,15 @@ Item {
   //
   // The QML watchdog is always the helper's deadline plus a margin, so the
   // helper reaps its own group before QML gives up on the helper.
-  function selectorRunArgv(deadlineMs, childArgv) {
+  function selectorRunArgv(deadlineMs, maxBytes, maxLines, maxLineBytes, childArgv) {
     return root.selectorEnvPrefix()
       .concat([root.pythonBin, "-I", "-B", root.helperPath,
                "run", "--setsid", "--stderr-to-null",
                "--deadline-ms", String(deadlineMs),
                "--kill-grace-ms", "1000",
-               "--max-output-bytes", "4096",
-               "--max-lines", "4",
-               "--max-line-bytes", "4096",
+               "--max-output-bytes", String(maxBytes),
+               "--max-lines", String(maxLines),
+               "--max-line-bytes", String(maxLineBytes),
                "--"])
       .concat(childArgv)
   }
@@ -717,7 +841,36 @@ Item {
       var choice = ok ? root.selectorChoice(proc.bpOutText) : ""
       if (choice !== "") {
         proc.bpStage = 2
-        root.bpStart(proc, watchdog, root.selectorRunArgv(30000, [proc.bpSetter, choice]), 35000)
+        // Stage 2 is budgeted DIFFERENTLY from stage 1, on purpose.
+        //
+        // Nothing consumes stage 2's output -- look below: completeSelector
+        // falls straight through to refreshBackground() and never reads
+        // bpOutText for stage 2. So a tight budget here buys no validation at
+        // all; it is purely a tripwire, and tripping it means EXIT_OUTPUT_CAP
+        // and a killpg in the MIDDLE of omarchy-theme-set, which sets
+        // symlinks, rewrites configs and restarts several daemons as it goes.
+        // A half-applied theme is a worse outcome than a few kilobytes of
+        // discarded chatter, and the thing item 4 actually asks for -- a
+        // bound, enforced producer-side, on a keep-loaded service -- is just
+        // as true at 64 KiB as at 4 KiB.
+        //
+        // These three numbers are the helper's OWN defaults for `run`
+        // (DEFAULT_MAX_OUTPUT_BYTES 65536, DEFAULT_MAX_LINES 4096,
+        // DEFAULT_MAX_LINE_BYTES 8192), so this is not a number invented
+        // here: it is the bound the supervisor already considers safe,
+        // spelled out rather than left implicit.
+        //
+        // 60 s rather than 30 s for the same reason. The deadline is the
+        // backstop, not the control, and the cost of it firing is again a
+        // half-applied theme. omarchy-theme-set restarts waybar, mako and
+        // friends and can regenerate caches on a first switch; 30 s was a
+        // guess made on a machine that cannot run it. 60 s is still a bound,
+        // and the QML watchdog stays above it at 65 s so the helper is always
+        // the one that reaps its own group.
+        root.bpSetCaps(proc, 65536, 4096, 8192)
+        root.bpStart(proc, watchdog,
+                     root.selectorRunArgv(60000, 65536, 4096, 8192,
+                                          [proc.bpSetter, choice]), 65000)
         return
       }
       // Nothing usable was picked -- the user cancelled, or the picker
@@ -744,7 +897,9 @@ Item {
     property int bpExit: -1
     property int bpStage: 0
     property string bpSetter: ""
-    // Mirrors the helper's producer-side budget for this chain exactly.
+    // The stage-1 budget; bpSetCaps reassigns these at every launch, so
+    // stage 2 runs under the wider one. Both mirror the helper's
+    // producer-side budget for that stage exactly.
     property int bpMaxChars: 4096
     property int bpMaxLines: 4
     property int bpMaxLineChars: 4096
@@ -784,6 +939,7 @@ Item {
     property int bpExit: -1
     property int bpStage: 0
     property string bpSetter: ""
+    // Stage-1 budget; bpSetCaps widens these for stage 2. See startSelector.
     property int bpMaxChars: 4096
     property int bpMaxLines: 4
     property int bpMaxLineChars: 4096
@@ -875,22 +1031,54 @@ Item {
 
   Component.onCompleted: refreshBackground()
 
-  // Nothing outlives this component. Signalling the helper terminates the
-  // helper, and PR_SET_PDEATHSIG (which the helper sets in the child it
-  // supervises, before the exec) makes the kernel signal that child the
-  // instant the helper dies, so the picker goes with it rather than being
-  // left attached to the session.
+  // SIGTERM, and deliberately NOTHING ELSE.
+  //
+  // This used to send signal(15) and then signal(9) on the very next
+  // statement, and that is not a faster version of the same thing -- it is a
+  // different and worse outcome. Measured against this plugin's own helper,
+  // `run --setsid -- bash -c 'sleep 300 & sleep 300'`:
+  //
+  //   TERM then KILL back to back -> helper rc=137, direct child dead,
+  //                                  GRANDCHILD ALIVE (state=S)
+  //   TERM alone                   -> helper rc=143, direct child dead,
+  //                                  GRANDCHILD DEAD
+  //
+  // The reason is that the whole-group teardown lives in the helper's SIGTERM
+  // handler (killpg(TERM) -> 1000 ms -> killpg(KILL) -> waitpid to ECHILD).
+  // SIGKILL cannot be handled, so a SIGKILL arriving before that handler has
+  // run means killpg never happens at all. PR_SET_PDEATHSIG does not cover
+  // the gap: the helper's own docstring says it reaches only the DIRECT
+  // child, so the picker's grandchildren -- anything the picker or the setter
+  // detached for itself -- survive orphaned.
+  //
+  // Escalation is not skipped out of optimism, it is skipped because there is
+  // nowhere to wait. Everywhere else in this file the escalation is TERM ->
+  // processKillTimer's 2000 ms -> KILL, and the 2000 deliberately exceeds the
+  // helper's 1000 ms grace (see bpTerminate). A timer cannot fire during
+  // destruction, so the only two options here are "TERM and give the helper
+  // its grace" or "TERM immediately followed by KILL", and the second is the
+  // one demonstrated to leave a process behind. processKillTimer is stopped
+  // for the same reason: a KILL already armed by an in-flight bpTerminate
+  // would land in exactly that window.
+  //
+  // What this therefore guarantees, and no more: every direct child is
+  // signalled SIGTERM, and each helper that is still able to run its handler
+  // tears its own group down. A helper already wedged past signals is not
+  // reached by this -- that case belongs to its own --deadline-ms, which is
+  // always set below the matching QML watchdog for that reason.
   Component.onDestruction: {
     configReadWatchdog.stop()
+    configStatWatchdog.stop()
+    configWatchTimer.stop()
     resolveLinkWatchdog.stop()
     bgSelectorWatchdog.stop()
     themeSelectorWatchdog.stop()
     processKillTimer.stop()
-    var procs = [configReadProc, resolveLinkProc, bgSelectorProc, themeSelectorProc]
+    var procs = [configReadProc, configStatProc, resolveLinkProc,
+                 bgSelectorProc, themeSelectorProc]
     for (var i = 0; i < procs.length; i++) {
       if (!procs[i].running) continue
       procs[i].signal(15)
-      procs[i].signal(9)
     }
   }
 
