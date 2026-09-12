@@ -417,28 +417,14 @@ for payload_dir in "${!payload_dirs[@]}"; do
   wpm_cfg mkdir-chain --root "$ROOT" --rel "$REL_PLUGIN_DIR/$payload_dir" --mode 0755
 done
 
-# Entries named in WPM_PAYLOAD that this installer must NOT copy, each with
-# its reason. Deliberately a short by-name list and NOT a "skip whatever is
-# missing" rule: the allowlist has to fail closed in both directions, so a
-# payload file absent for any other reason still aborts the install loudly
-# below rather than producing a half-installed plugin.
-#
-#   BoundedProcess.qml -- never created. The bounded process supervision it
-#     was going to hold is inlined in Background.qml instead, because sibling
-#     QML type resolution is unverified for this Quickshell version and an
-#     unresolvable type fails the WHOLE component at load -- i.e. no wallpaper
-#     at all. That is the fallback DESIGN.md section 8 names, and what the
-#     approved reference Panel.qml does. The entry belongs out of WPM_PAYLOAD;
-#     until it is removed there, it is skipped here, by name, with a reason.
-payload_skip=" BoundedProcess.qml "
-
+# The allowlist fails closed in both directions: nothing outside WPM_PAYLOAD
+# is ever installed, and a payload file that is named but cannot be copied
+# aborts the install loudly below rather than producing a half-installed
+# plugin.
 payload_keep=()
 for entry in "${WPM_PAYLOAD[@]}"; do
   payload_rel="${entry%:*}"
   payload_mode="${entry##*:}"
-  if [[ $payload_skip == *" $payload_rel "* ]]; then
-    continue
-  fi
   payload_keep+=(--keep "$payload_rel")
   wpm_cfg install-file \
     --src-root "$HERE" --src-rel "$payload_rel" \

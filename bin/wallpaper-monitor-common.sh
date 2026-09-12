@@ -290,7 +290,6 @@ export WPM_PLUGIN_ID WPM_NATIVE_PLUGIN_ID WPM_CLI WPM_MAX_CONFIG_BYTES \
 WPM_PAYLOAD=(
   "manifest.json:0644"
   "Background.qml:0644"
-  "BoundedProcess.qml:0644"
   "install.sh:0755"
   "uninstall.sh:0755"
   "README.md:0644"
