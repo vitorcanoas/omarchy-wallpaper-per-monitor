@@ -17,8 +17,13 @@
 # Precedence in the plugin: monitors[name] > portrait/landscape (based on
 # height > width post-rotation) > Omarchy's native symlink.
 #
-# The QML plugin watches this file live (FileView watchChanges: true) -- no
-# need to restart the shell after set/clear.
+# The QML plugin picks this file up live -- no need to restart the shell after
+# set/clear. It does NOT open the file itself: a 2000 ms repeating Timer in
+# Background.qml runs the helper's bounded, no-follow `stat` and compares the
+# identity it returns (type, mode, uid, gid, size, dev, ino, nlink, mtime_ns)
+# against the previous answer; any difference triggers the helper's bounded
+# `read`. So a set/clear shows up within about two seconds rather than
+# instantly.
 #
 # Per-orientation fallback idea ported from upstream PR #10249 (DCPRevere,
 # omacom/omarchy, https://github.com/omacom/omarchy/pull/10249).

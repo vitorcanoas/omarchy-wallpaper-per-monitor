@@ -3,8 +3,8 @@
 
 Port of the marketplace-approved
 `omarchy-nightlight/bin/omarchy-nightlight-config.py` (commit 78d9fb4) onto
-this plugin's boundaries, extended with the subcommand surface DESIGN.md
-section 3.3 specifies. Function names, flag sets, validation order and the
+this plugin's boundaries, extended with exactly the subcommands this plugin's
+five callers invoke. Function names, flag sets, validation order and the
 publish transaction are kept deliberately identical to the reference so a
 reviewer diffing the two files sees the same code; every divergence is marked
 with a comment saying WHY.
@@ -13,13 +13,21 @@ Invocation
 ----------
     "$PYTHON3" -I -B "$WPM_HELPER" <subcommand> [options] [-- <child argv>]
 
-Never executed directly: it ships mode 0644 with no executable bit, so the
-shebang above is never read by the kernel (DESIGN.md D3 -- the missing
-executable bit is the control, not the shebang text). `-I` neutralises
+Never executed directly. Line 1 above IS a shebang, and it is never consulted:
+this file ships mode 0644 with no executable bit, and every call site spells
+the interpreter out as an absolute path ("$PYTHON3" -I -B <helper>, where
+$PYTHON3 is /usr/bin/python3 validated by check-tool), so the kernel is never
+asked to read line 1. The missing executable bit is the control, not the
+shebang text; the shebang is kept only so a reader who opens the file knows
+which interpreter it is written for. `-I` neutralises
 PYTHONPATH/PYTHONHOME/site; `-B` keeps __pycache__ out of the plugin dir.
 
-Subcommand surface (DESIGN.md section 3.3 -- exactly these thirteen)
---------------------------------------------------------------------
+Subcommand surface -- exactly these eleven
+------------------------------------------
+One per operation the five callers actually perform. Nothing is defined here
+that nothing calls: an unreachable subcommand is attack surface that no test
+and no reviewer ever exercises.
+
   read          --root R --rel P [--max-bytes N] [--allow-missing]
   stat          --root R --rel P [--allow-missing]
   edit          --root R --rel P [--mode OCT] [--max-output-bytes N]
@@ -28,57 +36,57 @@ Subcommand surface (DESIGN.md section 3.3 -- exactly these thirteen)
   install-file  --src-root R1 --src-rel A --dst-root R2 --dst-rel B --mode OCT
                 [--max-bytes N]
   prune-dir     --root R --rel D (--keep REL)... [--remove-all] [--if-exists]
-                [--max-entries M]
   unlink        --root R --rel P [--if-exists] [--expect-dev-ino DEV:INO]
-  rmdir         --root R --rel P [--if-exists]
   symlink       --root R --rel P --target T [--replace]
-  rename        --root R --rel-from A --rel-to B
   resolve-link  --root R --rel P [--max-hops N] [--require-regular]
   run           [--setsid] [--deadline-ms N] [--kill-grace-ms N]
                 [--max-output-bytes N] [--max-lines N] [--max-line-bytes N]
                 [--stderr-to-null] -- <child argv>
   check-tool    (--path ABS)...
 
-Common options (DESIGN.md section 3.2), accepted by the filesystem
-subcommands: --root-follow-final, --trace, --expect-dev-ino, --if-exists,
---require-present, --json-errors, --max-bytes.
+Common options, accepted by every filesystem subcommand: --expect-dev-ino and
+--if-exists. That is the whole common set, for the same reason: an option no
+caller passes is a code path nobody exercises.
 
 Call sites served
 -----------------
-  read          bin/wallpaper-monitor:188-253 (load_target), bin/wp:54-89,
-                bin/wallpaper-monitor-menu:70-115 and :232-260 -- the four
-                readers of background-per-monitor.json, three unhardened.
-  edit          bin/wallpaper-monitor:256-296 (write_atomic) and every
-                *_locked mutation; install.sh:299-363 and uninstall.sh:149-214
-                (finalize_shell_json, duplicated verbatim) for both shell.json
-                and the JSONC menu file; install.sh:452-473 / :628-640 and
-                uninstall.sh:353-366 / :258-262, whose jq and awk programs are
-                reused BYTE-IDENTICAL as the filter argv.
-  mkdir-chain   install.sh:218, :286, :560; uninstall.sh:82, :97;
-                bin/wallpaper-monitor:167.
-  install-file  install.sh:234-247 (`rsync -a --delete` copy half + `chmod +x`);
-                also the backup copies at install.sh:372-373, :604-605 and
-                uninstall.sh:248-249, :340-341, which are a same-directory
-                install-file with the source's mode.
-  prune-dir     install.sh:234 (`--delete` half); uninstall.sh:390 (`rm -rf`).
-  stat          every `[[ -L ]]` / `[[ -f ]]` / `stat -c %a` probe:
-                install.sh:210, :265, :313, :326-327, :494-508;
-                uninstall.sh:163, :179, :292.
-  resolve-link  `readlink -f`: install.sh:495, :508; uninstall.sh:105, :295;
-                bin/wp:19; bin/wallpaper-monitor-menu:30.
-  symlink       install.sh:530 (`ln -s` in link_one).
-  unlink/rmdir  uninstall.sh:296; bin/wallpaper-monitor:114-147 (lock teardown).
-  rename        install.sh:350 / uninstall.sh:201 where a rename is not part of
-                an edit transaction.
-  run           every unbounded `$( ... )`: hyprctl (bin/wp:117, :172,
-                bin/wallpaper-monitor:611), `file -b --mime-type`
-                (bin/wallpaper-monitor:379), omarchy-menu-select /
-                omarchy-menu-images (bin/wallpaper-monitor-menu:338, :381),
-                and Background.qml's Process blocks.
-  check-tool    the preamble's resolve-once tool table (DESIGN.md D4).
+Line numbers are deliberately NOT quoted below -- they go stale the moment any
+of the five callers is edited, and a stale pointer is worse than a description.
 
-Exit codes (DESIGN.md section 3.4)
-----------------------------------
+  read          the four readers of ~/.config/omarchy/background-per-monitor.json
+                -- load_target() in bin/wallpaper-monitor, bin/wp's resolver,
+                bin/wallpaper-monitor-menu's two readers -- and Background.qml's
+                bounded read of the same file.
+  edit          write_atomic() in bin/wallpaper-monitor and every *_locked
+                mutation; finalize_shell_json() in install.sh and uninstall.sh
+                (duplicated verbatim) for both shell.json and the JSONC menu
+                file. Their jq and awk programs are reused BYTE-IDENTICAL as
+                the filter argv.
+  mkdir-chain   every `mkdir -p` in install.sh, uninstall.sh and
+                bin/wallpaper-monitor's config-directory setup.
+  install-file  the per-file half of install.sh's `rsync -a --delete` copy plus
+                the `chmod +x` that followed it, and the backup copies in
+                install.sh and uninstall.sh, which are a same-directory
+                install-file carrying the source's mode.
+  prune-dir     the `--delete` half of that same rsync, and uninstall.sh's
+                `rm -rf` of the plugin directory.
+  stat          every `[[ -L ]]` / `[[ -f ]]` / `stat -c %a` probe in install.sh
+                and uninstall.sh, and bin/wallpaper-monitor's pre-write probe.
+  resolve-link  every `readlink -f`: the symlink audits in install.sh and
+                uninstall.sh, bin/wp's and bin/wallpaper-monitor-menu's resolver,
+                and Background.qml's current-background resolution.
+  symlink       link_one() in install.sh and the restore path in uninstall.sh.
+  unlink        uninstall.sh's unlink_one().
+  run           every unbounded `$( ... )`: hyprctl in bin/wp and
+                bin/wallpaper-monitor, `file -b --mime-type` in
+                bin/wallpaper-monitor, omarchy-menu-select / omarchy-menu-images
+                in bin/wallpaper-monitor-menu, and Background.qml's two selector
+                stages -- the picker and omarchy-theme-set.
+  check-tool    the shared preamble's resolve-once tool table, and the four
+                lock primitives bin/wallpaper-monitor pins by absolute path.
+
+Exit codes
+----------
   0  success
   1  boundary violation -- symlink encountered, not a regular file, wrong
      owner, group/other-writable, over the byte cap, malformed, ELOOP, ENOTDIR.
@@ -92,16 +100,18 @@ Exit codes (DESIGN.md section 3.4)
   7  deadline exceeded -- group was torn down and reaped
   128+N  killed by signal N
 
-`bin/wallpaper-monitor`'s own EXIT_UNREADABLE=2 / EXIT_LOCK=3 are unchanged and
-are reached through the caller-side `wpm_map_exit()` of DESIGN.md section 3.4
-(1|4|5|6 -> EXIT_UNREADABLE, 3|7 -> EXIT_LOCK, 2 -> 1), so no user-visible exit
-code changes.
+These eleven numbers are load-bearing: Background.qml, install.sh, uninstall.sh
+and the three CLIs all branch on them today, and `bin/wallpaper-monitor`'s own
+EXIT_UNREADABLE=2 / EXIT_LOCK=3 are reached through the caller-side
+`wpm_map_exit()` in bin/wallpaper-monitor-common.sh (1|4|5|6 -> EXIT_UNREADABLE,
+3|7 -> EXIT_LOCK, 2 -> 1). No user-visible exit code changed in the migration,
+and none may change now.
 
 Errors are ONE bounded line on stderr:
     wallpaper-monitor-config: <subcommand>: <message>
-or, with --json-errors, one line of JSON. A traceback is never printed: it
-leaks absolute paths and interpreter internals into whatever log the caller is
-teeing, and callers branch only on the exit code.
+A traceback is never printed: it leaks absolute paths and interpreter internals
+into whatever log the caller is teeing, and callers branch only on the exit
+code.
 
 THE ONE DELIBERATE DIVERGENCE FROM THE APPROVED REFERENCE
 ---------------------------------------------------------
@@ -112,9 +122,9 @@ them would be a behaviour regression, not a hardening. So:
 
   * an EXISTING target keeps its own mode: the temp is fchmod'ed, on the held
     temp descriptor, to the mode read off the TARGET'S OWN VALIDATED
-    DESCRIPTOR -- never off a pathname `stat`, which is what install.sh:327
-    does today and which reports a symlink's 0777 and then stamps it onto the
-    real file;
+    DESCRIPTOR -- never off a pathname `stat`, which is what install.sh does
+    today in finalize_shell_json's mode probe and which reports a symlink's
+    0777 and then stamps it onto the real file;
   * a NEW target gets 0600, or --mode when the caller declares one;
   * either way a group- or other-writable target is REFUSED, and a --mode with
     0o022 bits set is REFUSED. Preserving a mode is not accepting any mode: we
@@ -122,8 +132,8 @@ them would be a behaviour regression, not a hardening. So:
 
 `install-file` is the documented exception and says so at its definition: a
 payload file's mode is declared by the installer's allowlist (0644/0755), so
-there --mode is authoritative. That is what replaces `chmod +x` at
-install.sh:247, making the executable bit travel with the allowlist entry.
+there --mode is authoritative. That is what replaces the installer's separate
+`chmod +x`, making the executable bit travel with the allowlist entry.
 
 Python 3 standard library only, so it runs under the system python3 with -I.
 """
@@ -155,11 +165,12 @@ EXIT_DEADLINE = 7
 
 # --- Caps: ONE source of truth ------------------------------------------
 #
-# The inventory flagged the status quo as both too loose and inconsistent:
-# bin/wallpaper-monitor:185 uses 1 MiB, and bin/wp:57 /
-# bin/wallpaper-monitor-menu:75 / :237 each re-declare the same 1 MiB as a bare
-# literal next to an UNBOUNDED `fh.read()`. Four copies of a number only one of
-# them enforces.
+# The status quo before this helper existed was both too loose and
+# inconsistent, which is why the cap lives here and only here:
+# bin/wallpaper-monitor declared a 1 MiB cap, and bin/wp and
+# bin/wallpaper-monitor-menu (twice) each re-declared the same 1 MiB as a bare
+# literal sitting next to an UNBOUNDED `fh.read()`. Four copies of a number
+# only one of them enforced.
 #
 # 256 KiB -- not the reference's 64 KiB and not 1 MiB:
 #   * the override map is a handful of monitor names and paths, a few hundred
@@ -203,7 +214,7 @@ MAX_PRUNE_DEPTH = 16
 DEFAULT_LINK_HOPS = 1
 MAX_LINK_HOPS = 8
 
-# run / edit supervision defaults (DESIGN.md D10).
+# run / edit supervision defaults.
 DEFAULT_DEADLINE_MS = 5000
 # 1000 ms, and it is load-bearing: Background.qml's own watchdog is 2000 ms, so
 # the helper must have finished escalating TERM -> KILL and reaped its group
@@ -222,12 +233,6 @@ MAX_MESSAGE_BYTES = 512
 
 PR_SET_PDEATHSIG = 1
 
-# Set from argv in main(). Module-level because this is a single-shot CLI and
-# threading them through every walk would add a parameter to every signature
-# for no behavioural gain.
-TRACE = False
-JSON_ERRORS = False
-
 
 class ConfigError(Exception):
     """An unsafe, malformed, or unavailable filesystem boundary.
@@ -240,7 +245,6 @@ class ConfigError(Exception):
     def __init__(self, message: str, code: int = EXIT_BOUNDARY) -> None:
         super().__init__(message)
         self.code = code
-        self.errno_name = ""
 
 
 def fail(message: str, code: int = EXIT_BOUNDARY) -> None:
@@ -248,9 +252,10 @@ def fail(message: str, code: int = EXIT_BOUNDARY) -> None:
 
 
 def fail_os(message: str, error: OSError, code: int = EXIT_BOUNDARY) -> None:
-    problem = ConfigError("%s: %s" % (message, error.strerror or error), code)
-    problem.errno_name = errno.errorcode.get(error.errno or 0, "")
-    raise problem
+    # strerror is already in the message, which is the whole of what the caller
+    # sees; the symbolic errno name was only ever consumed by the removed
+    # --json-errors output shape.
+    raise ConfigError("%s: %s" % (message, error.strerror or error), code)
 
 
 def usage_error(message: str) -> None:
@@ -299,22 +304,6 @@ def emit_line(text: str) -> None:
 def emit_bytes(data: bytes) -> None:
     """File payload. `data` is already capped by read_bounded."""
     write_fd(1, data)
-
-
-def trace(index: int, info: os.stat_result) -> None:
-    """Per-component identity, on stderr (stdout stays reserved for payload).
-
-    Component NAMES are deliberately not echoed: they came from the caller's
-    own argv, and printing an attacker-influenced name into a log is a
-    liability with no diagnostic value the numbers do not already carry.
-    """
-    if not TRACE:
-        return
-    sys.stderr.write(
-        "wpm-config-trace: component=%d dev=%d ino=%d mode=%04o uid=%d gid=%d nlink=%d\n"
-        % (index, info.st_dev, info.st_ino, stat.S_IMODE(info.st_mode),
-           info.st_uid, info.st_gid, info.st_nlink)
-    )
 
 
 # --- Component and path validation ---------------------------------------
@@ -399,7 +388,8 @@ def bounded_budget(text: str | None, ceiling: int = MAX_FILE_BYTES) -> int:
 
     If a caller could raise the ceiling, MAX_FILE_BYTES would be a default and
     the loosest call site would silently become the real limit -- exactly the
-    state the inventory flagged across the four existing readers.
+    state the four pre-existing readers were in, each with its own cap and
+    only one of them enforcing it.
     """
     if text is None:
         return ceiling
@@ -481,7 +471,6 @@ def open_directory_path(components: list[str], create: bool, mode: int,
             os.close(dirfd)
             dirfd = nextfd
             info = os.fstat(dirfd)
-            trace(index, info)
             if owner_rule == "system":
                 if info.st_uid not in (0, os.geteuid()):
                     fail("a parent directory is owned by another user")
@@ -516,7 +505,7 @@ def validate_dirfd(dirfd: int) -> os.stat_result:
     return directory_stat
 
 
-def open_root(root: str, follow_final: bool = False) -> int:
+def open_root(root: str) -> int:
     """Open and validate the trusted root, holding its descriptor.
 
     Note the asymmetry, which is the reference's (config.py:70-86) and is
@@ -525,33 +514,19 @@ def open_root(root: str, follow_final: bool = False) -> int:
     root itself gets the full fstat validation. A symlinked $HOME therefore
     fails -- intentionally, and identically to the approved reference.
 
-    --root-follow-final is the documented escape hatch for a symlinked $HOME:
-    it re-opens only the LAST component following symlinks, then applies the
-    same fstat validation. Off by default; the shipped code never passes it.
+    There is no escape hatch for a symlinked $HOME. One used to exist here as
+    a --root-follow-final flag that re-opened the last component following
+    symlinks; no caller in the plugin ever passed it, so it was an unexercised
+    way to weaken the root check and it is gone. If a symlinked $HOME ever has
+    to be supported, it must be designed and tested, not left lying here.
     """
     components = check_root(root)
-    if follow_final and components:
-        parent = open_directory_path(components[:-1], False, DIR_MODE_DEFAULT, "none")
-        if parent is None:
-            fail("root directory does not exist", EXIT_ABSENT)
-        try:
-            dirfd = os.open(components[-1],
-                            os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC,
-                            dir_fd=parent)
-        except FileNotFoundError:
-            os.close(parent)
-            fail("root directory does not exist", EXIT_ABSENT)
-        except OSError as error:
-            os.close(parent)
-            fail_os("could not open the root", error)
-        os.close(parent)
-    else:
-        opened = open_directory_path(components, False, DIR_MODE_DEFAULT, "none")
-        if opened is None:
-            fail("root directory does not exist", EXIT_ABSENT)
-        dirfd = opened
+    opened = open_directory_path(components, False, DIR_MODE_DEFAULT, "none")
+    if opened is None:
+        fail("root directory does not exist", EXIT_ABSENT)
+    dirfd = opened
     try:
-        trace(0, validate_dirfd(dirfd))
+        validate_dirfd(dirfd)
     except BaseException:
         os.close(dirfd)
         raise
@@ -592,7 +567,7 @@ def descend(dirfd: int, components: list[str], create: bool, mode: int) -> int:
                 fail_os("could not descend safely", error)
             os.close(current)
             current = nextfd
-            trace(index, validate_dirfd(current))
+            validate_dirfd(current)
         return current
     except BaseException:
         os.close(current)
@@ -600,20 +575,20 @@ def descend(dirfd: int, components: list[str], create: bool, mode: int) -> int:
 
 
 def open_parent(root: str, rel: str, create: bool = False,
-                mode: int = DIR_MODE_DEFAULT,
-                follow_final_root: bool = False) -> tuple[int, str]:
+                mode: int = DIR_MODE_DEFAULT) -> tuple[int, str]:
     """Return (parent dirfd, basename) for a --root/--rel target.
 
     The returned descriptor is THE descriptor for the whole transaction. It is
     never re-derived from a pathname: validation, temp creation, revalidation,
     rename and fsync all go through this one fd. That is the invariant the
-    shell code breaks at install.sh:356 and bin/wallpaper-monitor:289, where
-    the directory is re-opened by name AFTER the rename -- possibly a
-    different directory than the one the rename landed in.
+    shell code breaks in install.sh's finalize_shell_json and in
+    bin/wallpaper-monitor's write_atomic, where the directory is re-opened by
+    name AFTER the rename -- possibly a different directory than the one the
+    rename landed in.
     """
     components = split_rel(rel)
     basename = components[-1]
-    rootfd = open_root(root, follow_final_root)
+    rootfd = open_root(root)
     # descend() owns rootfd from here: it closes it as it walks, and on
     # failure. With no intermediate components it hands the same descriptor
     # straight back, which is correct -- the root IS the parent.
@@ -678,7 +653,8 @@ def read_bounded(fd: int, max_bytes: int) -> bytes:
     snapshot; a file can grow between the fstat and the read, and for some
     objects it lies outright. The bound is this loop: never ask for more than
     the remaining budget plus one byte, and fail the moment that extra byte
-    arrives. A single os.read(fd, CAP) -- what bin/wallpaper-monitor:221 does
+    arrives. A single os.read(fd, CAP) -- what bin/wallpaper-monitor's old
+    load_target did
     today -- silently TRUNCATES instead, which for a JSON config means the
     caller parses a prefix of the file as if it were the file.
     """
@@ -703,7 +679,8 @@ def same_target(dirfd: int, basename: str, original: os.stat_result | None) -> b
 
     Port of config.py:219-235 with the comparison tuple unchanged. This is the
     single largest gap between this repo and the approved reference: today
-    bin/wallpaper-monitor:277 and install.sh:350 rename over whatever is at
+    bin/wallpaper-monitor's write_atomic and install.sh's finalize_shell_json
+    rename over whatever is at
     the path at that instant, with no re-check at all.
 
     Every field earns its place:
@@ -760,7 +737,8 @@ def temp_name_for(basename: str) -> str:
 
     secrets.token_hex(16) = 128 bits from the OS CSPRNG. Not
     tempfile.mkstemp (8 characters, and no O_NOFOLLOW), not the PID, not a
-    timestamp, and no fixed `.tmp` suffix. bin/wallpaper-monitor:267 uses
+    timestamp, and no fixed `.tmp` suffix. bin/wallpaper-monitor's old temp
+    name used
     mkstemp(prefix=".background-per-monitor.", suffix=".tmp") today: the
     random middle does not help when the pattern around it is fixed, because
     an attacker never needs to guess the exact name -- they pre-create every
@@ -842,7 +820,8 @@ def publish(dirfd: int, basename: str, data: bytes,
             # forcing 0600 on it is a behaviour regression, not a hardening.
             #
             # The mode comes off old_stat, which is the fstat of the target's
-            # OWN VALIDATED DESCRIPTOR -- not a pathname stat. install.sh:327
+            # OWN VALIDATED DESCRIPTOR -- not a pathname stat. install.sh's
+            # `stat -c %a` mode probe
             # runs `stat -c %a -- "$dest"`, which on a symlink reports the
             # LINK's 0777 and then chmods the real file world-writable; that
             # whole class is unreachable from here, because old_stat can only
@@ -885,8 +864,9 @@ def publish(dirfd: int, basename: str, data: bytes,
 
         # Durability of the rename itself, through the SAME descriptor held
         # all along -- so this necessarily fsyncs the directory the rename
-        # landed in. install.sh:356 and bin/wallpaper-monitor:289 open the
-        # directory by name after the fact and may fsync a different one.
+        # landed in. install.sh's finalize_shell_json and
+        # bin/wallpaper-monitor's write_atomic open the directory by name after
+        # the fact and may fsync a different one.
         os.fsync(dirfd)
     finally:
         # Clean up dirfd-relatively. `rm /path/to/.name.hex` would re-resolve
@@ -903,21 +883,21 @@ def publish(dirfd: int, basename: str, data: bytes,
 
 
 def validate_tool(path: str, require_exec: bool) -> None:
-    """DESIGN.md D4's authoritative tool check.
+    """The authoritative tool check: pin an executable by identity, not name.
 
     Every parent from `/` is walked O_NOFOLLOW with uid in {0, euid} and no
     group/other write bit; the file itself must be a regular file with the
     same ownership and mode rule, plus the executable bit when required.
 
-    DIVERGENCE FROM DESIGN.md's wording, stated plainly: the design says
-    "same-directory-symlink policy". On Debian and Ubuntu /usr/bin/python3 is
-    a symlink to /etc/alternatives/python3, which is NOT in the same
-    directory, so a same-directory-only rule would reject the very interpreter
-    the design pins. Instead a final-component symlink is followed for at most
+    SYMLINK RULE, stated plainly. The obvious rule -- "a tool may be a symlink
+    only within its own directory" -- cannot be used: on Debian and Ubuntu
+    /usr/bin/python3 is a symlink to /etc/alternatives/python3, which is NOT in
+    the same directory, so that rule would reject the very interpreter this
+    plugin pins. Instead a final-component symlink is followed for at most
     MAX_LINK_HOPS hops and EACH hop is re-anchored and re-validated through
-    this same full walk. That is strictly stronger than "same directory" (a
-    same-directory symlink to a world-writable file would pass the design's
-    wording and fails here) and it does not break the default install.
+    this same full walk. That is strictly stronger than "same directory" -- a
+    same-directory symlink to a world-writable file would pass the simple rule
+    and fails here -- and it does not break the default install.
     """
     if not path.startswith("/"):
         usage_error("tool path must be absolute")
@@ -968,7 +948,7 @@ def validate_tool(path: str, require_exec: bool) -> None:
     fail("tool symlink chain is too long")
 
 
-# --- Bounded, supervised child processes (DESIGN.md D10) ------------------
+# --- Bounded, supervised child processes ----------------------------------
 
 
 _LIBC = None
@@ -985,6 +965,73 @@ def libc() -> object | None:
         except OSError:
             _LIBC = False
     return _LIBC or None
+
+
+# F4 -- the environment a supervised child is GIVEN, never the one it
+# inherits.
+#
+# supervise() used to end in os.execv(), which hands the child this process's
+# entire os.environ. Invocations from Background.qml are genuinely closed --
+# `/usr/bin/env -i` plus an explicit list -- but invocations from the shell get
+# only the preamble's DENYLIST, and a denylist has named survivors. The ones
+# that matter are glibc code- and data-loading vectors of exactly the same
+# class as the LD_* names the preamble does clear:
+#
+#   GCONV_PATH   loads iconv conversion modules (.so) from a caller's directory
+#   LOCPATH      loads locale objects from a caller's directory
+#   MAGIC        points `file` at a caller's magic database -- and `file -b
+#                --mime-type` IS this plugin's image gate, so this one decides
+#                what counts as an image
+#   NLSPATH      loads message catalogues from a caller's path
+#   HOSTALIASES  redirects name lookups
+#   TZDIR        loads timezone data from a caller's directory
+#
+# A denylist cannot be finished, because the next glibc release may add another
+# name. So the environment is CONSTRUCTED instead: only the names below cross
+# into the child, taken from os.environ if they are set there, and nothing else
+# does -- whatever the caller's own environment happens to contain.
+#
+# The list is exactly what the two closed call sites already hand us, so this
+# is a NO-OP for a caller that was already closed: Background.qml's picker
+# prefix passes PATH, HOME and the session names below, and filtering that set
+# through this allowlist returns the same set. The names are here because a GUI
+# picker genuinely needs them -- a Wayland/Hyprland client cannot find the
+# compositor without WAYLAND_DISPLAY, HYPRLAND_INSTANCE_SIGNATURE and
+# XDG_RUNTIME_DIR, cannot reach the session bus without
+# DBUS_SESSION_BUS_ADDRESS, and omarchy-* scripts read OMARCHY_PATH. hyprctl,
+# the other supervised child, needs the same first three.
+#
+# Nothing in this list selects code: no LD_*, no BASH_*, no PYTHON*, and no
+# name that names a module, catalogue or database directory. PATH is the one
+# entry that names directories programs are found in, and it is forwarded
+# rather than reconstructed because both call sites set it themselves to a
+# fixed, root-owned value.
+CHILD_ENV_ALLOWLIST = (
+    "PATH", "HOME", "USER", "LOGNAME", "LANG", "LC_ALL",
+    "XDG_RUNTIME_DIR", "XDG_SESSION_TYPE", "XDG_SESSION_DESKTOP",
+    "XDG_CURRENT_DESKTOP", "XDG_CONFIG_HOME", "XDG_CONFIG_DIRS",
+    "XDG_DATA_HOME", "XDG_DATA_DIRS", "XDG_STATE_HOME", "XDG_CACHE_HOME",
+    "WAYLAND_DISPLAY", "HYPRLAND_INSTANCE_SIGNATURE",
+    "DBUS_SESSION_BUS_ADDRESS", "OMARCHY_PATH",
+    "XCURSOR_THEME", "XCURSOR_SIZE",
+)
+
+# Used only when PATH is not set at all. Both shipped call sites set it, so
+# this is never reached in the plugin; it exists so that a child can never be
+# exec'd with NO PATH and fall back to whatever the C library's default is.
+CHILD_PATH_FALLBACK = "/usr/bin:/bin"
+
+
+def child_environment() -> dict[str, str]:
+    """Build the child's environment from the allowlist. Never inherited."""
+    env = {}
+    for name in CHILD_ENV_ALLOWLIST:
+        value = os.environ.get(name)
+        if value is None:
+            continue
+        env[name] = value
+    env.setdefault("PATH", CHILD_PATH_FALLBACK)
+    return env
 
 
 def signal_group(pgid: int | None, pid: int, signum: int) -> None:
@@ -1044,13 +1091,83 @@ def teardown(pid: int, pgid: int | None, grace_ms: int) -> None:
     reap_remaining()
 
 
+def group_alive(pgid: int) -> bool:
+    """Does the group still have members?
+
+    killpg(pgid, 0) delivers nothing; it only asks the kernel whether the group
+    exists. It is deliberately NOT used to decide whether a particular process
+    died -- a zombie answers signal 0 -- but a process group stops existing the
+    moment its last member is reaped, which is exactly the question here.
+    """
+    try:
+        os.killpg(pgid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        # Somebody else's now; treat it as present and let the TERM/KILL below
+        # fail harmlessly rather than pretending the group is gone.
+        return True
+    return True
+
+
+def teardown_group_after_exit(pgid: int, grace_ms: int) -> None:
+    """F6 -- tear the group down on the SUCCESS path, after the direct child
+    has already exited and been reaped.
+
+    teardown() above escalates TERM -> KILL by watching the DIRECT child, so it
+    is useless once that child is gone: waitpid returns ECHILD immediately, the
+    KILL round never happens, and a grandchild that ignores SIGTERM survives.
+    This one watches the GROUP instead.
+
+    Why the success path needs this at all: a child can exit 0 having left a
+    grandchild behind with stdout redirected away. EOF then arrives on our pipe
+    (nothing holds the write end open), we collect exit status 0, and the
+    grandchild runs on -- orphaned, unbounded, outliving the supervisor that
+    was supposed to own it. That is precisely the shape of the stage-2
+    omarchy-theme-set call, which used to be deliberately backgrounded.
+
+    The group is checked BEFORE it is signalled. A pgid can only be recycled
+    once the group is empty, so an empty group means there is nothing of ours
+    left to kill and we must send nothing at all -- signalling a recycled pgid
+    would reach somebody else's processes.
+    """
+    if not group_alive(pgid):
+        reap_remaining()
+        return
+    signal_group(pgid, pgid, signal.SIGTERM)
+    end = time.monotonic() + max(grace_ms, 0) / 1000.0
+    while group_alive(pgid):
+        if time.monotonic() >= end:
+            signal_group(pgid, pgid, signal.SIGKILL)
+            break
+        time.sleep(0.01)
+    reap_remaining()
+
+
 class Supervision:
-    """Caps applied on the PRODUCER side, before anything is forwarded.
+    """Caps on the child's STDOUT, applied on the PRODUCER side, before
+    anything is forwarded.
 
     Consumer-side bounding (`| head -c N`) was explicitly rejected: by the time
     the consumer truncates, the producer has already produced, and a producer
     that never stops is never stopped. Here the caps are checked as bytes
     arrive, and a breach tears the group down.
+
+    WHAT IS **NOT** IN THIS BUDGET, stated so the claim above is not read as
+    wider than it is: the child's STDERR. `run --stderr-to-null` sends it to
+    /dev/null, but `edit` -- whose filter is jq or awk -- leaves it pointing at
+    this process's own inherited fd 2, where it is neither counted nor
+    buffered. That is deliberate, and it is a noise bound rather than a
+    resource bound:
+      * it is never buffered in memory by us, so no amount of it can grow this
+        process; it goes straight to whatever the caller's fd 2 is;
+      * charging it against a budget whose breach KILLS the child would mean a
+        jq syntax error could abort the transaction by being wordy, and would
+        throw away the only diagnostic the caller gets when a filter fails;
+      * it is still bounded in TIME by the same deadline as stdout: the child
+        is torn down at the deadline whatever it is writing.
+    So stderr is unbounded in volume, and in exchange the filter's error
+    message survives to reach the user. Nothing else escapes the budget.
     """
 
     def __init__(self, max_output_bytes: int, max_lines: int,
@@ -1089,21 +1206,53 @@ def supervise(argv: list[str], stdin_data: bytes, *, deadline_ms: int,
               grace_ms: int, max_output_bytes: int, max_lines: int,
               max_line_bytes: int, use_setsid: bool,
               stderr_to_null: bool) -> bytes:
-    """Run a child with its own session, a hard deadline and producer-side
-    caps, and tear its whole group down on any failure.
+    """Run a child in a constructed environment, with its own session, a hard
+    deadline and producer-side stdout caps, and tear its whole group down on
+    EVERY exit path -- including the one where the child succeeded.
 
-    "Any failure" includes being signalled: SIGINT/SIGTERM reach this process
-    as the SystemExit that terminate() raises, and the supervision block below
-    catches it, tears the group down and reaps it before letting the exit
-    propagate. PR_SET_PDEATHSIG covers only the case this process CANNOT
-    handle -- SIGKILL, a crash, the QML side giving up -- and it covers only
-    the DIRECT child, so it is a backstop and not the guarantee: the kernel
-    signals that one child, while the child's own children are reached solely
-    by the group teardown here.
+    Every exit path, spelled out, because "on failure" was the bug:
+      * cap breach and deadline: tear down, then exit 6 / 7;
+      * signalled: SIGINT/SIGTERM reach this process as the SystemExit that
+        terminate() raises, and the `except BaseException` arm below catches
+        it, tears the group down and reaps it before letting the exit
+        propagate as 128+signum;
+      * child exited non-zero: same arm, then exit 3;
+      * child exited ZERO: teardown_group_after_exit() runs after the status
+        is collected. Without it a child could exit 0 having detached a
+        grandchild with stdout redirected away -- EOF arrives, we return 0, and
+        the grandchild outlives us. See that function.
+
+    PR_SET_PDEATHSIG covers only the case this process CANNOT handle --
+    SIGKILL, a crash, the QML side giving up -- and it covers only the DIRECT
+    child, so it is a backstop and not the guarantee: the kernel signals that
+    one child, while the child's own children are reached solely by the group
+    teardown here.
+
+    The environment is built, not inherited: see CHILD_ENV_ALLOWLIST and the
+    execve() below.
     """
     if not argv:
         usage_error("no child argv after '--'")
+    # F9 -- yes, this is TWO resolutions of one pathname: validate_tool()
+    # walks argv[0] descriptor-relatively, and the execve() below then hands
+    # the same pathname back to the kernel, which resolves it again. That is
+    # the check-then-use pattern the per-component walk exists to avoid
+    # everywhere else in this file, and it is not exploitable here. Every
+    # argv[0] that reaches this function is an absolute path under /usr/bin or
+    # /usr/local/bin, supplied by the plugin's own resolve-once tool table, and
+    # validate_tool's parent-chain rule is what enforces that: every directory
+    # from / down to the tool must be owned by root or by us and must not be
+    # group- or other-writable. Nobody who is not already root or us can swap
+    # anything on that path between the two resolutions, and if they were, the
+    # walk would not be the weak link. Closing the gap properly would mean
+    # fexecve() on the descriptor validate_tool held -- which needs that
+    # descriptor plumbed out of it and /proc mounted -- and it buys nothing
+    # against this threat model. Left as-is, deliberately, so a future reader
+    # does not read it as an oversight.
     validate_tool(argv[0], require_exec=True)
+    # F4 -- built in the PARENT, from an allowlist, and handed to execve below.
+    # Nothing about the caller's own environment reaches the child implicitly.
+    child_env = child_environment()
     libc()  # warm the loader BEFORE forking
 
     out_r, out_w = os.pipe()
@@ -1134,7 +1283,11 @@ def supervise(argv: list[str], stdin_data: bytes, *, deadline_ms: int,
                     pass
             signal.signal(signal.SIGINT, signal.SIG_DFL)
             signal.signal(signal.SIGTERM, signal.SIG_DFL)
-            os.execv(argv[0], argv)
+            # execve, not execv: the third argument is the constructed
+            # environment. execv would pass os.environ, and the child's
+            # environment would then be whatever survived the caller's
+            # denylist. See CHILD_ENV_ALLOWLIST.
+            os.execve(argv[0], argv, child_env)
         except BaseException:
             os._exit(127)
         os._exit(127)
@@ -1246,6 +1399,18 @@ def supervise(argv: list[str], stdin_data: bytes, *, deadline_ms: int,
             tear_down_once()
             fail("child exceeded the %d ms deadline" % deadline_ms, EXIT_DEADLINE)
         reap_remaining()
+
+        # F6 -- the group comes down here too, on the path where NOTHING went
+        # wrong. The child's own exit status has just been collected above, so
+        # this can no longer change what we report; what it does is make sure
+        # the child cannot leave a grandchild behind by exiting 0 after
+        # detaching one with stdout redirected away. Only reachable with a
+        # group of our own: without --setsid the "group" is this process's own,
+        # and signalling it would signal us and our caller.
+        if pgid is not None:
+            torn_down = True
+            teardown_group_after_exit(pgid, grace_ms)
+
         if status is not None:
             if os.WIFSIGNALED(status):
                 transaction_error("child was killed by signal %d" % os.WTERMSIG(status))
@@ -1264,9 +1429,9 @@ def check_entry_cap(data: bytes) -> None:
     """Bound the ENTRY COUNT of a JSON payload before it is published.
 
     The reference has this (config.py:16 / :161-162) and this repo has it
-    nowhere: `data["monitors"][monitor] = image` at bin/wallpaper-monitor:440
-    grows without limit, and Background.qml:97 JSON.parse accepts an object of
-    any size. A config that is under the byte cap can still be an object with
+    nowhere: the `data["monitors"][monitor] = image` assignment in
+    bin/wallpaper-monitor's set path grows without limit, and Background.qml's
+    JSON.parse of the same file accepts an object of any size. A config that is under the byte cap can still be an object with
     tens of thousands of keys, which is a memory and parse-time problem in the
     long-lived shell process rather than in this short-lived one.
 
@@ -1295,7 +1460,7 @@ def command_read(opts: Options) -> None:
     try:
         fd, info = open_target_file(dirfd, basename, max_bytes)
         if fd is None:
-            if opts.flag("allow-missing") and not opts.flag("require-present"):
+            if opts.flag("allow-missing"):
                 return
             fail("target does not exist", EXIT_ABSENT)
         try:
@@ -1330,7 +1495,7 @@ def command_stat(opts: Options) -> None:
         try:
             info = os.stat(basename, dir_fd=dirfd, follow_symlinks=False)
         except FileNotFoundError:
-            if opts.flag("allow-missing") and not opts.flag("require-present"):
+            if opts.flag("allow-missing"):
                 emit_line("type=absent")
                 return
             fail("target does not exist", EXIT_ABSENT)
@@ -1359,7 +1524,7 @@ def command_stat(opts: Options) -> None:
 
 def command_edit(opts: Options) -> None:
     """Read -> pure stdin->stdout filter -> publish, in ONE process holding
-    ONE dirfd (DESIGN.md D8).
+    ONE dirfd.
 
     This is the decision that removes the largest real hole in install.sh and
     uninstall.sh. Today shell.json is touched three times by pathname --
@@ -1389,8 +1554,9 @@ def command_edit(opts: Options) -> None:
     try:
         old_fd, old_stat = open_target_file(dirfd, basename, max_bytes)
         if old_fd is None:
-            if opts.flag("require-present"):
-                fail("target does not exist", EXIT_ABSENT)
+            # A missing target is created, not refused: every edit call site in
+            # the plugin runs against a file that may legitimately not exist
+            # yet (a fresh shell.json, a first override).
             content = b""
         else:
             check_expected_identity(old_stat, opts.value("expect-dev-ino"))
@@ -1427,7 +1593,7 @@ def command_edit(opts: Options) -> None:
 def command_mkdir_chain(opts: Options) -> None:
     mode = parse_mode(opts.value("mode")) if opts.value("mode") else DIR_MODE_DEFAULT
     components = split_rel(opts.require("rel"))
-    rootfd = open_root(opts.require("root"), opts.flag("root-follow-final"))
+    rootfd = open_root(opts.require("root"))
     # descend() owns rootfd (see its docstring) -- never close it here too.
     dirfd = descend(rootfd, components, create=True, mode=mode)
     # fsync the leaf: a directory a caller is about to publish into must exist
@@ -1441,12 +1607,12 @@ def command_mkdir_chain(opts: Options) -> None:
 def command_install_file(opts: Options) -> None:
     """Copy one payload file, both ends fully validated.
 
-    Replaces the per-file half of `rsync -a --delete` (install.sh:234-246) and
-    the `chmod +x` at :247. rsync re-resolves every path by name inside a
+    Replaces the per-file half of install.sh's `rsync -a --delete` and the
+    `chmod +x` that followed it. rsync re-resolves every path by name inside a
     process we do not control, so no descriptor can be held across validation
-    and copy; the scar at install.sh:205-217 -- a symlinked plugin dir whose
-    target's contents `--delete` erased -- is that property showing up as a
-    bug report.
+    and copy; the scar install.sh still carries a guard for -- a symlinked
+    plugin dir whose target's contents `--delete` erased -- is that property
+    showing up as a bug report.
 
     --mode is AUTHORITATIVE here, unlike edit's preserve rule: a payload
     file's mode is declared by the installer's allowlist, which is what makes
@@ -1471,8 +1637,8 @@ def command_install_file(opts: Options) -> None:
     # create=True: the destination tree (the plugin dir and its bin/) is ours
     # to make, at 0o700. Anything already there is opened O_NOFOLLOW, so a
     # symlink planted at an intermediate component fails instead of
-    # redirecting the payload -- which is the bug install.sh:210 guards by
-    # hand, and only for the final component.
+    # redirecting the payload -- which is the bug install.sh guards by hand,
+    # and only for the final component.
     dst_dirfd, dst_name = opts.open_parent(root_key="dst-root", rel_key="dst-rel",
                                            create=True)
     old_fd: int | None = None
@@ -1509,7 +1675,7 @@ def remove_tree(dirfd: int, name: str, depth: int, max_entries: int) -> int:
     Never descends into a symlink: a symlink is unlinked as an entry, and a
     directory is opened O_NOFOLLOW so a component swapped underneath us fails
     with ELOOP instead of pointing the delete at somebody else's tree. That is
-    the difference from `rm -rf "$PLUGIN_DIR"` at uninstall.sh:390, whose only
+    the difference from uninstall.sh's `rm -rf "$PLUGIN_DIR"`, whose only
     guard is a `[[ -d ]]` that follows symlinks.
     """
     if depth > MAX_PRUNE_DEPTH:
@@ -1573,16 +1739,17 @@ def command_prune_dir(opts: Options) -> None:
     the prune cannot disagree about what belongs there -- which is the failure
     mode `--include` ordering rules invite.
     """
-    max_entries = min(parse_positive(opts.value("max-entries"), "--max-entries")
-                      if opts.value("max-entries") else MAX_PRUNE_ENTRIES,
-                      MAX_PRUNE_ENTRIES)
+    # MAX_PRUNE_ENTRIES is the only entry bound, not a default a caller can
+    # move: every prune in the plugin walks the plugin's own directory, and a
+    # caller-supplied ceiling was an option nothing ever passed.
+    max_entries = MAX_PRUNE_ENTRIES
     keep = build_keep_tree(opts.repeated("keep"))
     remove_all = opts.flag("remove-all")
     if remove_all and keep:
         usage_error("--remove-all and --keep are mutually exclusive")
 
     components = split_rel(opts.require("rel"))
-    rootfd = open_root(opts.require("root"), opts.flag("root-follow-final"))
+    rootfd = open_root(opts.require("root"))
     parentfd = descend(rootfd, components[:-1], False, DIR_MODE_DEFAULT)
     basename = components[-1]
     try:
@@ -1637,7 +1804,7 @@ def command_unlink(opts: Options) -> None:
             fail_os("could not inspect the target", error)
 
         if stat.S_ISDIR(info.st_mode):
-            fail("target is a directory; use rmdir or prune-dir")
+            fail("target is a directory; use prune-dir")
 
         # Closes the check-then-act in uninstall.sh's unlink_one: the caller
         # passes back the identity `stat` reported, and we refuse if the
@@ -1653,34 +1820,6 @@ def command_unlink(opts: Options) -> None:
             fail("target does not exist", EXIT_ABSENT)
         except OSError as error:
             fail_os("could not remove the target", error)
-        os.fsync(dirfd)
-    finally:
-        os.close(dirfd)
-
-
-def command_rmdir(opts: Options) -> None:
-    dirfd, basename = opts.open_parent()
-    try:
-        try:
-            info = os.stat(basename, dir_fd=dirfd, follow_symlinks=False)
-        except FileNotFoundError:
-            if opts.flag("if-exists"):
-                emit_line("absent")
-                return
-            fail("target does not exist", EXIT_ABSENT)
-        except OSError as error:
-            fail_os("could not inspect the target", error)
-        if stat.S_ISLNK(info.st_mode):
-            # rmdir on a symlink-to-directory would fail anyway; saying so is
-            # better than surfacing ENOTDIR.
-            fail("target is a symlink, not a directory")
-        if not stat.S_ISDIR(info.st_mode):
-            fail("target is not a directory")
-        check_expected_identity(info, opts.value("expect-dev-ino"))
-        try:
-            os.rmdir(basename, dir_fd=dirfd)
-        except OSError as error:
-            fail_os("could not remove the directory", error)
         os.fsync(dirfd)
     finally:
         os.close(dirfd)
@@ -1748,40 +1887,14 @@ def command_symlink(opts: Options) -> None:
         os.close(dirfd)
 
 
-def command_rename(opts: Options) -> None:
-    """renameat(dirfd_a, A, dirfd_b, B), both ends descriptor-relative."""
-    from_dirfd, from_name = opts.open_parent(rel_key="rel-from")
-    to_dirfd = -1
-    try:
-        to_dirfd, to_name = opts.open_parent(rel_key="rel-to")
-        if os.fstat(from_dirfd).st_dev != os.fstat(to_dirfd).st_dev:
-            # rename(2) cannot cross filesystems, and the caller almost
-            # certainly meant an atomic replace. Failing here beats a
-            # half-copied file: /tmp is tmpfs and $HOME is btrfs on the
-            # developer's own machine, which is why install.sh:378-384 puts
-            # its temp file in the destination directory in the first place.
-            fail("source and destination are on different filesystems")
-        try:
-            os.replace(from_name, to_name, src_dir_fd=from_dirfd,
-                       dst_dir_fd=to_dirfd)
-        except OSError as error:
-            fail_os("could not rename", error, EXIT_TRANSACTION)
-        os.fsync(from_dirfd)
-        os.fsync(to_dirfd)
-    finally:
-        os.close(from_dirfd)
-        if to_dirfd >= 0:
-            os.close(to_dirfd)
-
-
 def command_resolve_link(opts: Options) -> None:
     """`readlink -f`, bounded and without following a directory symlink.
 
     Hops are resolved only while the result stays inside --root: a target that
     leaves the trusted subtree is reported as-is rather than chased through
-    directories we have no business validating. Callers (install.sh:495,
-    uninstall.sh:295) compare the answer to a path they already know, so a
-    string is exactly what they need.
+    directories we have no business validating. The callers -- the symlink
+    audits in install.sh and uninstall.sh -- compare the answer to a path they
+    already know, so a string is exactly what they need.
     """
     hops = (parse_positive(opts.value("max-hops"), "--max-hops")
             if opts.value("max-hops") else DEFAULT_LINK_HOPS)
@@ -1802,12 +1915,11 @@ def command_resolve_link(opts: Options) -> None:
         if not relative:
             break
         try:
-            dirfd, basename = open_parent(
-                root, relative, follow_final_root=opts.flag("root-follow-final"))
+            dirfd, basename = open_parent(root, relative)
         except ConfigError as error:
             # A missing directory BELOW the first hop means the link dangles.
-            # `readlink -f` reports the path anyway, and install.sh:504-516
-            # depends on being told about a dangling link rather than an
+            # `readlink -f` reports the path anyway, and install.sh's symlink
+            # audit depends on being told about a dangling link rather than an
             # error -- it has a whole branch for that case.
             if first or error.code != EXIT_ABSENT:
                 raise
@@ -1852,7 +1964,7 @@ def command_resolve_link(opts: Options) -> None:
 
 
 def command_run(opts: Options) -> None:
-    """Bounded, supervised child (DESIGN.md D10).
+    """Bounded, supervised child.
 
     Replaces every unbounded `$( ... )` in the repo. QML's direct child is
     this helper, so the QML side never needs a process-group API: the helper
@@ -1894,10 +2006,12 @@ def command_check_tool(opts: Options) -> None:
 
 # --- argv parsing and dispatch -------------------------------------------
 
-# Common options every filesystem subcommand accepts (DESIGN.md section 3.2).
+# Common options every filesystem subcommand accepts. Both have call sites:
+# --expect-dev-ino closes uninstall.sh's check-then-act on unlink, --if-exists
+# is how the installer and uninstaller ask for idempotent removal. Nothing else
+# is accepted, because an option no caller passes is an unexercised code path.
 COMMON_VALUED = {"expect-dev-ino"}
-COMMON_FLAGS = {"root-follow-final", "trace", "json-errors", "if-exists",
-                "require-present"}
+COMMON_FLAGS = {"if-exists"}
 
 # (valued options, boolean flags, repeatable options, takes a `-- child argv`)
 SPEC: dict[str, tuple[set[str], set[str], set[str], bool]] = {
@@ -1908,11 +2022,9 @@ SPEC: dict[str, tuple[set[str], set[str], set[str], bool]] = {
     "mkdir-chain": ({"root", "rel", "mode"}, set(), set(), False),
     "install-file": ({"src-root", "src-rel", "dst-root", "dst-rel", "mode",
                       "max-bytes"}, set(), set(), False),
-    "prune-dir": ({"root", "rel", "max-entries"}, {"remove-all"}, {"keep"}, False),
+    "prune-dir": ({"root", "rel"}, {"remove-all"}, {"keep"}, False),
     "unlink": ({"root", "rel"}, set(), set(), False),
-    "rmdir": ({"root", "rel"}, set(), set(), False),
     "symlink": ({"root", "rel", "target"}, {"replace"}, set(), False),
-    "rename": ({"root", "rel-from", "rel-to"}, set(), set(), False),
     "resolve-link": ({"root", "rel", "max-hops"}, {"require-regular"}, set(), False),
     "run": ({"deadline-ms", "kill-grace-ms", "max-output-bytes", "max-lines",
              "max-line-bytes"}, {"setsid", "stderr-to-null"}, set(), True),
@@ -1953,8 +2065,7 @@ class Options:
     def open_parent(self, root_key: str = "root", rel_key: str = "rel",
                     create: bool = False) -> tuple[int, str]:
         return open_parent(self.require(root_key), self.require(rel_key),
-                           create=create,
-                           follow_final_root=self.flag("root-follow-final"))
+                           create=create)
 
 
 def parse_argv(argv: list[str]) -> Options:
@@ -2009,48 +2120,38 @@ HANDLERS = {
     "install-file": command_install_file,
     "prune-dir": command_prune_dir,
     "unlink": command_unlink,
-    "rmdir": command_rmdir,
     "symlink": command_symlink,
-    "rename": command_rename,
     "resolve-link": command_resolve_link,
     "run": command_run,
     "check-tool": command_check_tool,
 }
 
 
-def report(command: str, message: str, code: int, errno_name: str = "") -> None:
+def report(command: str, message: str, code: int) -> None:
     """ONE bounded line on stderr. Never a traceback: it leaks absolute paths
     and interpreter internals into whatever log the caller is teeing, and no
-    caller branches on anything but the exit code."""
-    if JSON_ERRORS:
-        line = json.dumps({
-            "tool": PROGNAME,
-            "cmd": sanitize(command),
-            "code": code,
-            "errno": errno_name,
-            "message": sanitize(message),
-        }, ensure_ascii=True)
-        sys.stderr.write(line[:MAX_MESSAGE_BYTES * 2] + "\n")
-        return
+    caller branches on anything but the exit code.
+
+    There is exactly one format. A --json-errors variant used to live here and
+    nothing in the plugin ever passed the flag, so the JSON branch was a second
+    output shape that no caller parsed and no run exercised. `code` is kept in
+    the signature because it is what the caller returns, not because it is
+    printed.""" 
     sys.stderr.write("%s: %s: %s\n"
                      % (PROGNAME, sanitize(command), sanitize(message)))
 
 
 def main(argv: list[str]) -> int:
-    global TRACE, JSON_ERRORS
-    TRACE = "--trace" in argv
-    JSON_ERRORS = "--json-errors" in argv
     command = "?"
     try:
         opts = parse_argv(argv)
         command = opts.command
         HANDLERS[command](opts)
     except ConfigError as error:
-        report(command, str(error), error.code, error.errno_name)
+        report(command, str(error), error.code)
         return error.code
     except OSError as error:
-        report(command, error.strerror or str(error), EXIT_BOUNDARY,
-               errno.errorcode.get(error.errno or 0, ""))
+        report(command, error.strerror or str(error), EXIT_BOUNDARY)
         return EXIT_BOUNDARY
     except Exception:
         # Catch-all so an unforeseen bug still exits with a code the caller
