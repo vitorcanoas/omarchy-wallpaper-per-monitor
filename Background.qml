@@ -422,6 +422,14 @@ Item {
   // KILL across its whole process group and waitpid it to ECHILD before this
   // last-resort signal reaches the helper itself. Inverting that ordering is
   // precisely how grandchildren escape.
+  //
+  // Which is also why every deadline here is the HELPER's deadline plus a
+  // margin (120000/125000 and 30000/35000) rather than the other way round:
+  // the group teardown belongs to the helper, and this escalation is only the
+  // backstop for a helper that is itself wedged. In that backstop case the
+  // helper's own child still dies with it through PR_SET_PDEATHSIG, but a
+  // grandchild of the picker would not -- one more reason the helper's
+  // deadline must always be the one that fires first.
   function bpTerminate(proc) {
     if (!proc.running) return
     proc.bpTermPending = true
@@ -486,10 +494,6 @@ Item {
       root.configReadQueued = true
       return
     }
-    root.startConfigRead()
-  }
-
-  function startConfigRead() {
     root.configReadQueued = false
     root.bpStart(configReadProc, configReadWatchdog,
                  root.helperEnvPrefix.concat(
@@ -538,7 +542,7 @@ Item {
                    (configReadProc.bpErrText || "no detail") +
                    " -- keeping the previous overrides")
     }
-    if (root.configReadQueued) Qt.callLater(root.startConfigRead)
+    if (root.configReadQueued) Qt.callLater(root.scheduleConfigRead)
   }
 
   Process {
@@ -871,10 +875,11 @@ Item {
 
   Component.onCompleted: refreshBackground()
 
-  // Nothing outlives this component. The helper reaps its own process group
-  // on SIGTERM -- its import-time handler raises SystemExit so the finally
-  // blocks run, the group is torn down and waitpid'ed to ECHILD -- and the
-  // SIGKILL is the backstop for a helper that cannot.
+  // Nothing outlives this component. Signalling the helper terminates the
+  // helper, and PR_SET_PDEATHSIG (which the helper sets in the child it
+  // supervises, before the exec) makes the kernel signal that child the
+  // instant the helper dies, so the picker goes with it rather than being
+  // left attached to the session.
   Component.onDestruction: {
     configReadWatchdog.stop()
     resolveLinkWatchdog.stop()
