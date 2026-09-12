@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+#!/usr/bin/bash
 # wp - pick a wallpaper by number, per monitor.
 #   wp                 list both catalogues
 #   wp h 12            apply the 12th landscape image to the landscape monitor
@@ -7,18 +7,55 @@
 #   wp h               list the landscape catalogue only
 # The monitor is found by its real orientation (hyprctl), never by a hardcoded
 # name.
+#
+# SHEBANG: absolute, and `/usr/bin/bash` rather than `/bin/bash` -- on Arch
+# /bin is a SYMLINK to usr/bin, which the helper's per-component no-follow
+# walk correctly refuses. Background.qml:230 pins the same spelling.
 set -uo pipefail
 
-# LC_ALL=C pins the catalogue order. Without it the glob follows LC_COLLATE,
-# which differs between an interactive terminal and a keybind/systemd call --
-# the same `wp h 5` picked different art depending on where it was called from
-# (art-10 sorting before or after art-2). The numbering the user memorizes has
-# to be stable.
-export LC_ALL=C
+# --- Closed-environment bootstrap (copied verbatim from the preamble) -----
+# This replaces `SELF="$(readlink -f "${BASH_SOURCE[0]}")"` -- a PATH-resolved
+# tool, run before any hardening existed, and without the `CDPATH=''` / `pwd -P`
+# the approved reference uses. The preamble re-derives WPM_BIN_DIR from its own
+# ${BASH_SOURCE[0]} with builtins only, so this script no longer derives a path
+# of its own at all.
+wpm_bootstrap() {
+  local self=${BASH_SOURCE[1]} dir candidate
+  dir=${self%/*}; [[ $dir == "$self" ]] && dir=.
+  dir=$(CDPATH='' cd -P -- "$dir" 2>/dev/null && pwd -P) || dir=""
+  local -a candidates=(
+    "$dir/wallpaper-monitor-common.sh"        # a bin/ script, run directly
+    "$dir/bin/wallpaper-monitor-common.sh"    # install.sh / uninstall.sh
+    "$HOME/.config/omarchy/plugins/vitorcanoas.background-per-monitor/bin/wallpaper-monitor-common.sh"
+  )                                           # via the ~/.local/bin symlink
+  for candidate in "${candidates[@]}"; do
+    [[ -f $candidate && ! -L $candidate && -r $candidate && -O $candidate ]] || continue
+    WPM_COMMON=$candidate; return 0
+  done
+  printf 'wallpaper-monitor: shared preamble not found or not trustworthy\n' >&2
+  exit 1
+}
+wpm_bootstrap
+# shellcheck source=bin/wallpaper-monitor-common.sh
+. "$WPM_COMMON"
 
-SELF="$(readlink -f "${BASH_SOURCE[0]}")"
-CLI="$(dirname "$SELF")/wallpaper-monitor"
-[[ -x $CLI ]] || CLI="wallpaper-monitor"
+# NOTE: no `set -e` here, deliberately -- this script collects `rc=$?` from the
+# CLI it invokes. The preamble sets `-uo pipefail` and never `errexit` for
+# exactly this reason.
+
+# The preamble exports LC_ALL=C (and LANG=C), which is what the hand-rolled
+# `export LC_ALL=C` here used to do. The reason it matters is unchanged:
+# without it the catalogue glob follows LC_COLLATE, which differs between an
+# interactive terminal and a keybind/systemd call -- the same `wp h 5` picked
+# different art depending on where it was called from (art-10 sorting before
+# or after art-2). The numbering the user memorizes has to be stable.
+
+# The sibling CLI, by absolute path. It used to fall back to the BARE NAME
+# "wallpaper-monitor" when the sibling was not executable, i.e. to a
+# PATH-resolved child process -- exactly the ambient resolution finding 1
+# names. WPM_CLI is "$WPM_BIN_DIR/wallpaper-monitor", and WPM_BIN_DIR came
+# from the preamble's own BASH_SOURCE, so there is nothing left to guess.
+CLI="$WPM_CLI"
 
 # Root of the art catalogue. This resolution mirrors the one in
 # wallpaper-monitor-menu -- both must find the SAME catalogue, otherwise the
@@ -49,16 +86,28 @@ resolve_catalogue_root() {
 
   # Deduce from an already-written override: a path like
   # .../catalogue/render/16x9/art.png puts the root two levels above the file.
-  local j="$HOME/.config/omarchy/background-per-monitor.json" root
-  if [[ -f $j ]]; then
-    root="$(python3 - "$j" <<'PYEOF' 2>/dev/null || true
+  #
+  # The READ is the shared, hardened one now. What used to be here was this
+  # file's own copy of a reader -- `os.path.getsize()` on the pathname, then a
+  # separate plain `open()` of the same pathname, then an unbounded
+  # `fh.read()`: a TOCTOU between the size check and the open, no O_NOFOLLOW,
+  # no S_ISREG, no owner check, and a cap that was never actually enforced.
+  # bin/wallpaper-monitor-menu had two more copies of it. All four now go
+  # through one helper `read`, which validates on the descriptor it reads
+  # from and stops at WPM_MAX_CONFIG_BYTES instead of truncating to it.
+  #
+  # Failure stays SILENT and falls through to the next candidate, exactly as
+  # the old `2>/dev/null || true` did: a config this script cannot read is not
+  # this script's business to report -- `wallpaper-monitor list` is.
+  local rel=".config/omarchy/background-per-monitor.json" raw="" root="" prog
+  raw="$(wpm_cfg read --root "$HOME" --rel "$rel" \
+                      --max-bytes "$WPM_MAX_CONFIG_BYTES" --allow-missing 2>/dev/null)" || raw=""
+  if [[ -n $raw ]]; then
+    IFS= read -r -d '' prog <<'PYEOF' || true
 import json, os, sys
 try:
-    if os.path.getsize(sys.argv[1]) > (1 << 20):
-        sys.exit(1)
-    with open(sys.argv[1], "rb") as fh:
-        d = json.loads(fh.read().decode("utf-8"))
-except (OSError, ValueError, UnicodeDecodeError):
+    d = json.loads(sys.stdin.buffer.read().decode("utf-8"))
+except (ValueError, UnicodeDecodeError):
     sys.exit(1)
 if not isinstance(d, dict):
     sys.exit(1)
@@ -86,14 +135,17 @@ for c in p:
         print(r)
         break
 PYEOF
-)"
+    root="$(printf '%s' "$raw" | "$PYTHON3" -I -c "$prog" 2>/dev/null)" || root=""
     [[ -n $root && -d $root ]] && { printf '%s\n' "$root"; return 0; }
   fi
 
-  # Last resort: the checkout beside this script.
+  # Last resort: the checkout beside this script. WPM_BIN_DIR is already the
+  # physical directory of bin/, resolved once by the preamble, so this is the
+  # same answer `$(dirname "$(readlink -f ...)")/..` used to produce -- with no
+  # external tool and no CDPATH exposure.
   local base
-  base="$(cd "$(dirname "$SELF")/.." && pwd)"
-  [[ -d "$base/render" ]] && { printf '%s\n' "$base/render"; return 0; }
+  base="$(CDPATH='' cd -P -- "$WPM_BIN_DIR/.." 2>/dev/null && pwd -P)" || base=""
+  [[ -n $base && -d "$base/render" ]] && { printf '%s\n' "$base/render"; return 0; }
   return 1
 }
 
@@ -109,12 +161,17 @@ fi
 # override would go to a monitor that does not exist. Validating the format is
 # simpler than converting the whole pipeline to NUL, and real connector names
 # (DP-2, HDMI-A-1, eDP-1, desc:...) fit here comfortably.
-MONITOR_RE='^[A-Za-z0-9._:-]+$'
+#
+# The pattern itself now comes from the preamble (WPM_MONITOR_RE), byte for
+# byte what was spelled out here, so this file, bin/wallpaper-monitor and
+# bin/wallpaper-monitor-menu cannot drift apart.
 
 mon_by_orientation() {  # $1 = portrait|landscape
-  command -v hyprctl >/dev/null 2>&1 || { echo "error: hyprctl not found (is Hyprland running?)" >&2; return 1; }
+  wpm_optional HYPRCTL
+  [[ -n $HYPRCTL ]] || { echo "error: hyprctl not found (is Hyprland running?)" >&2; return 1; }
+  wpm_require GREP TR HEAD
   local candidates
-  candidates="$(hyprctl monitors -j | python3 -c "
+  candidates="$("$HYPRCTL" monitors -j | "$PYTHON3" -I -c "
 import sys, json
 
 target = sys.argv[1]
@@ -155,12 +212,12 @@ for m in monitors:
   if [ -z "$candidates" ]; then
     return 1
   fi
-  local n; n=$(printf '%s\n' "$candidates" | grep -c .)
+  local n; n=$(printf '%s\n' "$candidates" | "$GREP" -c .)
   if [ "$n" -gt 1 ]; then
-    echo "warning: more than one $1 monitor detected ($(printf '%s' "$candidates" | tr '\n' ' ')); using the first" >&2
+    echo "warning: more than one $1 monitor detected ($(printf '%s' "$candidates" | "$TR" '\n' ' ')); using the first" >&2
     echo "         to choose another, pass its name: wp <h|v> <n> <MONITOR>" >&2
   fi
-  printf '%s\n' "$candidates" | head -n1
+  printf '%s\n' "$candidates" | "$HEAD" -n1
 }
 
 # Check that the monitor requested by name exists, is enabled and has the
@@ -168,8 +225,9 @@ for m in monitors:
 # a nonexistent monitor without complaining.
 validate_monitor() {  # $1 = name, $2 = portrait|landscape
   local name="$1" target="$2"
-  command -v hyprctl >/dev/null 2>&1 || { echo "error: hyprctl not found (is Hyprland running?)" >&2; return 1; }
-  hyprctl monitors -j | python3 -c "
+  wpm_optional HYPRCTL
+  [[ -n $HYPRCTL ]] || { echo "error: hyprctl not found (is Hyprland running?)" >&2; return 1; }
+  "$HYPRCTL" monitors -j | "$PYTHON3" -I -c "
 import sys, json
 
 name, target = sys.argv[1], sys.argv[2]
@@ -211,7 +269,7 @@ sys.exit(1)
 }
 
 list_catalogue() { # $1 = directory, $2 = label
-  local d="$R/$1" i=1 f
+  local d="$R/$1" i=1 f base
   [ -d "$d" ] || { echo "  (no $1)"; return 0; }
   echo "== $2 =="
   local a=()
@@ -219,7 +277,10 @@ list_catalogue() { # $1 = directory, $2 = label
   a=("$d"/*.png)
   shopt -u nullglob
   for f in "${a[@]}"; do
-    printf "  %2d. %s\n" "$i" "$(basename "${f%.png}")"
+    # Parameter expansion, not `basename`: one fewer ambient-PATH tool, same
+    # answer for every path a glob can produce.
+    base="${f%.png}"
+    printf "  %2d. %s\n" "$i" "${base##*/}"
     i=$((i+1))
   done
   return 0
@@ -257,7 +318,7 @@ apply() { # $1 = 16x9|9x16, $2 = index, $3 = portrait|landscape, $4 = monitor (o
 
   local mon
   if [ -n "$mon_requested" ]; then
-    if [[ ! "$mon_requested" =~ $MONITOR_RE ]]; then
+    if [[ ! "$mon_requested" =~ $WPM_MONITOR_RE ]]; then
       echo "error: invalid monitor name: '$mon_requested'" >&2
       return 1
     fi
@@ -269,7 +330,7 @@ apply() { # $1 = 16x9|9x16, $2 = index, $3 = portrait|landscape, $4 = monitor (o
       echo "error: no $target monitor detected" >&2
       return 1
     fi
-    if [[ ! "$mon" =~ $MONITOR_RE ]]; then
+    if [[ ! "$mon" =~ $WPM_MONITOR_RE ]]; then
       echo "error: hyprctl reported an unexpected monitor name: '$mon'" >&2
       return 1
     fi
@@ -281,7 +342,10 @@ apply() { # $1 = 16x9|9x16, $2 = index, $3 = portrait|landscape, $4 = monitor (o
 }
 
 usage() {
-  cat <<'EOF'
+  local text
+  # `read -r -d ''` instead of `cat <<EOF`: identical bytes, one fewer
+  # ambient-PATH tool.
+  IFS= read -r -d '' text <<'EOF' || true
 usage: wp                    list both catalogues
        wp h <n> [MONITOR]    apply the nth landscape image
        wp v <n> [MONITOR]    apply the nth portrait image
@@ -291,6 +355,7 @@ MONITOR is optional: by default wp picks the first monitor with the requested
 orientation. Pass its name (as shown by `hyprctl monitors`) when more than one
 monitor shares that orientation. E.g.: wp h 5 DP-3
 EOF
+  printf '%s' "$text"
 }
 
 rc=0
