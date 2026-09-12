@@ -1092,10 +1092,14 @@ def supervise(argv: list[str], stdin_data: bytes, *, deadline_ms: int,
     """Run a child with its own session, a hard deadline and producer-side
     caps, and tear its whole group down on any failure.
 
-    PR_SET_PDEATHSIG is set in the child so that if THIS process dies
-    unexpectedly -- SIGKILL, a crash, the QML side giving up -- the kernel
-    signals the child immediately instead of leaving an orphan attached to the
-    user's session forever.
+    "Any failure" includes being signalled: SIGINT/SIGTERM reach this process
+    as the SystemExit that terminate() raises, and the supervision block below
+    catches it, tears the group down and reaps it before letting the exit
+    propagate. PR_SET_PDEATHSIG covers only the case this process CANNOT
+    handle -- SIGKILL, a crash, the QML side giving up -- and it covers only
+    the DIRECT child, so it is a backstop and not the guarantee: the kernel
+    signals that one child, while the child's own children are reached solely
+    by the group teardown here.
     """
     if not argv:
         usage_error("no child argv after '--'")
@@ -1149,6 +1153,20 @@ def supervise(argv: list[str], stdin_data: bytes, *, deadline_ms: int,
     pending = stdin_data
     breach: str | None = None
     expired = False
+    torn_down = False
+
+    def tear_down_once() -> None:
+        """teardown(), at most once, whichever exit path arrives here first.
+
+        Once the group leader has been reaped its pgid can in principle be
+        recycled, so a second round of TERM/KILL could reach a group that is
+        no longer ours. The second caller is therefore a no-op.
+        """
+        nonlocal torn_down
+        if torn_down:
+            return
+        torn_down = True
+        teardown(pid, pgid, grace_ms)
 
     os.set_blocking(out_r, False)
     os.set_blocking(in_w, False)
@@ -1160,70 +1178,83 @@ def supervise(argv: list[str], stdin_data: bytes, *, deadline_ms: int,
         os.close(in_w)
         in_w = -1
 
+    # From here to the `return`, EVERY abnormal exit tears the group down: the
+    # cap, deadline and unreaped-child paths call tear_down_once() explicitly,
+    # and `except BaseException` catches everything else -- above all the
+    # SystemExit that terminate() raises on SIGINT/SIGTERM. Without this arm a
+    # signal unwound straight out of the poll loop and the group we created
+    # outlived us: the direct child died via PR_SET_PDEATHSIG, but a
+    # grandchild of it kept running, orphaned. The exception is re-raised
+    # unchanged, so a signal still exits 128+signum and the cap and deadline
+    # paths still exit with their own codes.
     try:
-        while True:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                expired = True
-                break
-            for fd, event in poller.poll(int(min(remaining, 0.25) * 1000.0)):
-                if fd == out_r and event & (select.POLLIN | select.POLLHUP):
-                    chunk = os.read(out_r, READ_CHUNK)
-                    if not chunk:
-                        poller.unregister(out_r)
-                        os.close(out_r)
-                        out_r = -1
-                        break
-                    breach = caps.feed(chunk)
-                    if breach:
-                        break
-                elif fd == in_w and event & select.POLLOUT:
-                    try:
-                        written = os.write(in_w, pending)
-                    except BrokenPipeError:
-                        written = len(pending)
-                    pending = pending[written:]
-                    if not pending:
+        try:
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    expired = True
+                    break
+                for fd, event in poller.poll(int(min(remaining, 0.25) * 1000.0)):
+                    if fd == out_r and event & (select.POLLIN | select.POLLHUP):
+                        chunk = os.read(out_r, READ_CHUNK)
+                        if not chunk:
+                            poller.unregister(out_r)
+                            os.close(out_r)
+                            out_r = -1
+                            break
+                        breach = caps.feed(chunk)
+                        if breach:
+                            break
+                    elif fd == in_w and event & select.POLLOUT:
+                        try:
+                            written = os.write(in_w, pending)
+                        except BrokenPipeError:
+                            written = len(pending)
+                        pending = pending[written:]
+                        if not pending:
+                            poller.unregister(in_w)
+                            os.close(in_w)
+                            in_w = -1
+                    elif fd == in_w and event & (select.POLLERR | select.POLLHUP):
+                        # The child closed stdin without reading it all. Normal for
+                        # a filter that stops early; not our problem to report.
                         poller.unregister(in_w)
                         os.close(in_w)
                         in_w = -1
-                elif fd == in_w and event & (select.POLLERR | select.POLLHUP):
-                    # The child closed stdin without reading it all. Normal for
-                    # a filter that stops early; not our problem to report.
-                    poller.unregister(in_w)
-                    os.close(in_w)
-                    in_w = -1
-            if breach or out_r == -1:
-                break
-    finally:
-        for fd in (out_r, in_w):
-            if fd >= 0:
-                try:
-                    os.close(fd)
-                except OSError:
-                    pass
+                if breach or out_r == -1:
+                    break
+        finally:
+            for fd in (out_r, in_w):
+                if fd >= 0:
+                    try:
+                        os.close(fd)
+                    except OSError:
+                        pass
 
-    if breach:
-        teardown(pid, pgid, grace_ms)
-        fail(breach, EXIT_OUTPUT_CAP)
-    if expired:
-        teardown(pid, pgid, grace_ms)
-        fail("child exceeded the %d ms deadline" % deadline_ms, EXIT_DEADLINE)
+        if breach:
+            tear_down_once()
+            fail(breach, EXIT_OUTPUT_CAP)
+        if expired:
+            tear_down_once()
+            fail("child exceeded the %d ms deadline" % deadline_ms, EXIT_DEADLINE)
 
-    # A floor of one second: stdout is closed, so the child is exiting; a
-    # zero-length wait here would report a bogus deadline breach for a child
-    # that simply had not been reaped yet.
-    status = wait_for(pid, max(1.0, deadline - time.monotonic()))
-    if status == -1:
-        teardown(pid, pgid, grace_ms)
-        fail("child exceeded the %d ms deadline" % deadline_ms, EXIT_DEADLINE)
-    reap_remaining()
-    if status is not None:
-        if os.WIFSIGNALED(status):
-            transaction_error("child was killed by signal %d" % os.WTERMSIG(status))
-        if os.WIFEXITED(status) and os.WEXITSTATUS(status) != 0:
-            transaction_error("child exited %d" % os.WEXITSTATUS(status))
-    return caps.data()
+        # A floor of one second: stdout is closed, so the child is exiting; a
+        # zero-length wait here would report a bogus deadline breach for a child
+        # that simply had not been reaped yet.
+        status = wait_for(pid, max(1.0, deadline - time.monotonic()))
+        if status == -1:
+            tear_down_once()
+            fail("child exceeded the %d ms deadline" % deadline_ms, EXIT_DEADLINE)
+        reap_remaining()
+        if status is not None:
+            if os.WIFSIGNALED(status):
+                transaction_error("child was killed by signal %d" % os.WTERMSIG(status))
+            if os.WIFEXITED(status) and os.WEXITSTATUS(status) != 0:
+                transaction_error("child exited %d" % os.WEXITSTATUS(status))
+        return caps.data()
+    except BaseException:
+        tear_down_once()
+        raise
 
 
 # --- Subcommands ---------------------------------------------------------
@@ -2035,8 +2066,10 @@ def terminate(signum: int, _frame: object) -> None:
     """Port of config.py:337-342.
 
     Raising SystemExit rather than dying in the default handler means the
-    `finally` blocks run: the temp file is unlinked dirfd-relatively, the
-    supervised child's group is torn down, and the descriptors are closed. A
+    cleanup handlers run on the way out: the temp file is unlinked
+    dirfd-relatively, the descriptors are closed, and supervise()'s
+    `except BaseException` arm tears down and reaps the supervised child's
+    whole process group before this exit propagates any further. A
     SIGTERM mid-transaction otherwise leaves an unpredictably named 0600 file
     in the user's config directory forever, and an orphaned process group.
     128+signum is the shell's own convention for "killed by N", so callers
