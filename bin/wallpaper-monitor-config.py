@@ -1760,19 +1760,36 @@ def command_resolve_link(opts: Options) -> None:
     root = normalize_absolute(opts.require("root"))
     rel = opts.require("rel")
     resolved = normalize_absolute(root + "/" + rel)
+    dangling = False
+    first = True
     for _ in range(hops + 1):
         if not (resolved == root or resolved.startswith(root + "/")):
+            # The chain left the trusted subtree. Report where it pointed
+            # rather than walking directories we have no standing to validate.
             break
         relative = resolved[len(root):].lstrip("/")
         if not relative:
             break
-        dirfd, basename = open_parent(root, relative,
-                                      follow_final_root=opts.flag("root-follow-final"))
+        try:
+            dirfd, basename = open_parent(
+                root, relative, follow_final_root=opts.flag("root-follow-final"))
+        except ConfigError as error:
+            # A missing directory BELOW the first hop means the link dangles.
+            # `readlink -f` reports the path anyway, and install.sh:504-516
+            # depends on being told about a dangling link rather than an
+            # error -- it has a whole branch for that case.
+            if first or error.code != EXIT_ABSENT:
+                raise
+            dangling = True
+            break
         try:
             try:
                 info = os.stat(basename, dir_fd=dirfd, follow_symlinks=False)
             except FileNotFoundError:
-                fail("target does not exist", EXIT_ABSENT)
+                if first:
+                    fail("target does not exist", EXIT_ABSENT)
+                dangling = True
+                break
             except OSError as error:
                 fail_os("could not inspect the target", error)
             if not stat.S_ISLNK(info.st_mode):
@@ -1782,6 +1799,7 @@ def command_resolve_link(opts: Options) -> None:
             target = os.readlink(basename, dir_fd=dirfd)
         finally:
             os.close(dirfd)
+        first = False
         if len(target.encode("utf-8", "surrogateescape")) > MAX_PATH_BYTES:
             fail("symlink target is longer than %d bytes" % MAX_PATH_BYTES)
         if target.startswith("/"):
@@ -1791,6 +1809,9 @@ def command_resolve_link(opts: Options) -> None:
             resolved = normalize_absolute(parent + "/" + target)
     else:
         fail("symlink chain is longer than %d hops" % hops)
+
+    if dangling and opts.flag("require-regular"):
+        fail("resolved target does not exist", EXIT_ABSENT)
 
     if len(resolved.encode("utf-8", "surrogateescape")) > MAX_PATH_BYTES:
         fail("resolved path is longer than %d bytes" % MAX_PATH_BYTES)
