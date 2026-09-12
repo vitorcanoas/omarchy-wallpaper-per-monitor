@@ -344,6 +344,26 @@ else
   SHELL_JSON="$OMARCHY_CONFIG_DIR/shell.json"
 fi
 
+# PLUGIN_DIR is the symlink TARGET, and link_one below compares it against
+# what `resolve-link` says an existing symlink points at. Those two strings
+# have to be produced by the same code or the comparison is not a comparison:
+# `resolve-link` answers with a LEXICALLY NORMALISED absolute path (its
+# documented `realpath -m` contract), while the line above builds one by
+# concatenating $HOME. A $HOME that is merely SPELLED differently -- a
+# trailing slash, a doubled separator -- names the same directory but a
+# different string, and then our own symlink reads as a foreign file:
+# install refuses with "already exists and is not this plugin's symlink" on
+# the second run, and uninstall leaves the link behind. Normalising here
+# makes both sides come out of the helper's normaliser.
+#
+# `--rel .` is pure string work: the helper's normaliser is documented as
+# doing no filesystem access at all, so it neither follows nor requires anything
+# on disk, and it is emphatically NOT a `readlink -f` coming back in. It also
+# cannot widen what the helper accepts as a --root, because PLUGIN_DIR is
+# never used as one -- it is a message and a symlink target, nothing else.
+PLUGIN_DIR="$(wpm_cfg resolve-link --root "$PLUGIN_DIR" --rel .)" \
+  || wpm_die "could not normalise the plugin directory path"
+
 # --- 1. Copy the plugin payload -------------------------------------------
 #
 # A copy rather than a symlink: omarchy-plugin-validate refuses symlinks
@@ -653,6 +673,12 @@ link_one() {
     # re-validates the parent chain at every hop instead of handing the whole
     # pathname to the kernel once. --require-regular is what tells a live
     # link from a dangling one: a dangling chain comes back as exit 4.
+    #
+    # The comparison below is string equality, and it is only sound because
+    # BOTH sides come out of the helper's normaliser: $resolved by definition,
+    # $target because PLUGIN_DIR was normalised where it is assigned. Compare
+    # a normalised answer against a hand-concatenated path and an install of
+    # our own symlink starts refusing itself (see the note there).
     rc=0
     resolved="$(wpm_cfg resolve-link --root "$ROOT" --rel "$rel_link" \
                   --max-hops 4 --require-regular 2>/dev/null)" || rc=$?

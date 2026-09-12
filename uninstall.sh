@@ -218,7 +218,14 @@ if [[ $DRY_RUN == 1 ]]; then
   # would be removed wholesale by step 3 regardless, so the dry run's output
   # is unaffected.
   REAL_PLUGIN_DIR_REL=".config/omarchy/plugins/$PLUGIN_ID"
-  real_plugin_dir="$OMARCHY_CONFIG_DIR/plugins/$PLUGIN_ID"
+  # Normalised for the same reason PLUGIN_DIR is below: the `case` further
+  # down matches it against `resolve-link` output, which is always lexically
+  # normalised. Left raw, a $HOME with a trailing slash or a doubled
+  # separator makes every one of our own links look foreign, and the dry run
+  # would preview "leaving it alone" for links a real uninstall removes.
+  real_plugin_dir="$(wpm_cfg resolve-link \
+    --root "$OMARCHY_CONFIG_DIR/plugins/$PLUGIN_ID" --rel .)" \
+    || wpm_die "could not normalise the plugin directory path"
   # Assigned first and tested afterwards, never `[[ "$(stat_key ...)" == x ]]`:
   # a command substitution that fails INSIDE `[[ ]]` is invisible to errexit, so
   # a boundary refusal would read as "absent" and the script would carry on. In
@@ -293,6 +300,24 @@ else
   PLUGIN_DIR="$OMARCHY_CONFIG_DIR/plugins/$PLUGIN_ID"
   SHELL_JSON="$OMARCHY_CONFIG_DIR/shell.json"
 fi
+
+# Same normalisation install.sh does where it assigns PLUGIN_DIR, and for the
+# same reason: unlink_one below compares this string against what
+# `resolve-link` reports a symlink points at, and `resolve-link` answers with
+# a LEXICALLY NORMALISED absolute path while the line above builds one by
+# concatenating $HOME. A $HOME spelled with a trailing slash or a doubled
+# separator names the same directory but a different string, and then our own
+# symlink fails to match -- uninstall would print "is not this plugin's
+# symlink", exit 0, and LEAVE THE LINK BEHIND, now dangling, after step 3 has
+# removed the plugin directory it points into. Both sides must come out of
+# the same normaliser.
+#
+# `--rel .` is pure string work (the helper's normaliser does no filesystem
+# access at all), so it is not a `readlink -f` in disguise: nothing is followed and
+# nothing has to exist -- which matters here, because unlink_one deliberately
+# still matches a DANGLING link whose target is already gone.
+PLUGIN_DIR="$(wpm_cfg resolve-link --root "$PLUGIN_DIR" --rel .)" \
+  || wpm_die "could not normalise the plugin directory path"
 
 # --- 0. Remove our row from the SUPER+SPACE menu ---------------------------
 #
@@ -410,6 +435,11 @@ unlink_one() {
     # target path, which is exactly what we want to compare here -- the same
     # property `readlink -f` had, minus handing the whole pathname to the
     # kernel in one go.
+    #
+    # The equality below is sound only because BOTH sides are normalised by
+    # the same code: $resolved by definition, $expected_target because
+    # PLUGIN_DIR was normalised where it is assigned. A raw, concatenated
+    # expected path is how this stops removing our own symlinks.
     resolved="$(wpm_cfg resolve-link --root "$ROOT" --rel "$rel_link" --max-hops 4)" \
       || resolved=""
     if [[ -n $resolved && $resolved == "$expected_target" ]]; then
