@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/bash
 # OPTIONAL AND MANUAL. Nothing runs this for you: Omarchy has no install hook,
 # and `omarchy plugin remove` runs nothing either.
 #
@@ -7,10 +7,10 @@
 # does three things, in order:
 #
 #   1. Copies this repo into ~/.config/omarchy/plugins/vitorcanoas.background-per-monitor/
-#      -- but only the files named in the allowlist at step 1 below
-#      (manifest.json, Background.qml, bin/, and the docs a user may want to
-#      read in place). Anything not on that list is NOT installed, including
-#      any file added to the repo later.
+#      -- but only the files named in the WPM_PAYLOAD allowlist in
+#      bin/wallpaper-monitor-common.sh (manifest.json, the QML, bin/, and the
+#      docs a user may want to read in place). Anything not on that list is
+#      NOT installed, including any file added to the repo later.
 #   2. Registers the plugin and disables the native one in
 #      ~/.config/omarchy/shell.json (backed up first), and records in
 #      cloneSourceRestores[] that THIS plugin is what disabled the native
@@ -43,9 +43,49 @@
 #
 #     rm -f ~/.config/omarchy/shell.json.bak.*
 
-set -euo pipefail
+set -uo pipefail
 
-HERE="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+# The user's login PATH, captured BEFORE the preamble pins PATH to
+# /usr/bin:/bin. Read for exactly one purpose -- the advisory note at the end
+# of this script about ~/.local/bin not being on PATH -- and never used to
+# resolve a program. Without capturing it here that note would always fire,
+# because the pinned PATH cannot contain a home directory by construction.
+WPM_LOGIN_PATH="${PATH:-}"
+
+# --- Closed-environment bootstrap ------------------------------------------
+# Builtins only: finding the trustworthy tools is the very thing this is
+# bootstrapping, so it cannot call one. See the header of
+# bin/wallpaper-monitor-common.sh for what these four tests do and do not
+# prove.
+wpm_bootstrap() {
+  local self=${BASH_SOURCE[1]} dir candidate
+  dir=${self%/*}
+  [[ $dir == "$self" ]] && dir=.
+  dir=$(CDPATH='' cd -P -- "$dir" 2>/dev/null && pwd -P) || dir=""
+  local -a candidates=(
+    "$dir/wallpaper-monitor-common.sh"
+    "$dir/bin/wallpaper-monitor-common.sh"
+    "$HOME/.config/omarchy/plugins/vitorcanoas.background-per-monitor/bin/wallpaper-monitor-common.sh"
+  )
+  for candidate in "${candidates[@]}"; do
+    [[ -f $candidate && ! -L $candidate && -r $candidate && -O $candidate ]] || continue
+    WPM_COMMON=$candidate
+    return 0
+  done
+  printf 'wallpaper-monitor: shared preamble not found or not trustworthy\n' >&2
+  exit 1
+}
+wpm_bootstrap
+# shellcheck source=bin/wallpaper-monitor-common.sh
+. "$WPM_COMMON"
+# The preamble deliberately never sets errexit (bin/wp needs it off); this
+# script has always run with it on.
+set -e
+
+# The repo root. The preamble re-derives WPM_BIN_DIR from its OWN BASH_SOURCE
+# with `CDPATH='' cd -P` + `pwd -P`, which is what this line used to do by
+# hand with neither the CDPATH reset nor -P.
+HERE="${WPM_BIN_DIR%/*}"
 
 PLUGIN_ID="vitorcanoas.background-per-monitor"
 NATIVE_PLUGIN_ID="omarchy.background"
@@ -112,114 +152,243 @@ menu_entry_block() {
   printf '%s\n' "$MENU_MARK_END"
 }
 
-# Single cleanup trap for the whole script (DRY_RUN staging dir and/or the
-# real-path TMP_JSON below) -- a second `trap ... EXIT` would silently
-# replace this one rather than stack, so anything that needs cleanup on exit
-# must be added to this same function instead of calling `trap` again.
+# One no-follow `fstatat` answering the questions `[[ -e ]]`, `[[ -L ]]`,
+# `[[ -f ]]` and `stat -c %a` used to answer by pathname. Every one of those
+# tests resolved the whole path afresh -- including its parent chain -- so the
+# thing tested was never provably the thing later written; the helper walks
+# the chain component by component with O_NOFOLLOW and reports on the
+# descriptor it ends up holding.
+#
+# Prints the value of KEY ("type", "mode", "dev", "ino", ...) for $2 below
+# root $1, or nothing when the key is absent. A missing target yields
+# type=absent and no other key, so `[[ -z $mode ]]` means "not there".
+stat_key() {
+  local out line rc=0
+  out=$(wpm_cfg stat --root "$1" --rel "$2" --allow-missing 2>/dev/null) || rc=$?
+  if (( rc == 4 )); then
+    # --allow-missing covers a missing FINAL component; a missing parent
+    # directory is reported as absent (exit 4) by the walk itself. Both mean
+    # the same thing to every caller here: there is nothing at that path.
+    out="type=absent"
+  elif (( rc != 0 )); then
+    # Re-run without the stderr redirection so the helper's own one-line
+    # diagnosis (symlinked component, wrong owner, group-writable parent, ...)
+    # is what the user sees before we give up.
+    wpm_cfg stat --root "$1" --rel "$2" --allow-missing >/dev/null || true
+    wpm_die "could not inspect $1/$2 safely"
+  fi
+  while IFS= read -r line; do
+    if [[ $line == "$3="* ]]; then
+      printf '%s\n' "${line#*=}"
+      return 0
+    fi
+  done <<<"$out"
+  return 0
+}
+
+# Backup suffix: the same <date>-<time>-<subsecond> shape the `date
+# +%Y%m%d-%H%M%S-%N` calls produced, built from bash builtins so no ambient
+# `date` is involved. The sub-second part is still what stops two runs in the
+# same second from clobbering each other's backup of the ORIGINAL state; it is
+# microseconds now rather than nanoseconds, which is finer than any two
+# sequential runs of this script can be.
+backup_stamp() {
+  printf '%(%Y%m%d-%H%M%S)T-%s\n' -1 "${EPOCHREALTIME#*.}"
+}
+
+# Single cleanup trap for the whole script (the DRY_RUN staging dir) -- a
+# second `trap ... EXIT` would silently replace this one rather than stack, so
+# anything that needs cleanup on exit must be added to this same function
+# instead of calling `trap` again.
+#
+# The transaction temp files this used to remove (TMP_JSON, TMP_MENU) are
+# gone: every write now goes through the helper's `edit`, which stages inside
+# the destination directory under an unpredictable 128-bit name on a held
+# descriptor and unlinks it dirfd-relatively in its own `finally`. There is no
+# longer a temp pathname for this script to know about, let alone clean up.
 cleanup() {
-  [[ -n "${STAGE:-}" ]] && rm -rf "$STAGE"
-  [[ -n "${TMP_JSON:-}" ]] && rm -f "$TMP_JSON"
-  [[ -n "${TMP_MENU:-}" ]] && rm -f "$TMP_MENU"
+  if [[ -n "${STAGE_REL:-}" ]]; then
+    wpm_cfg prune-dir --root "$HOME" --rel "$STAGE_REL" --remove-all --if-exists \
+      >/dev/null 2>&1 || true
+  fi
   return 0
 }
 trap cleanup EXIT
 
+# --- 0. Dependencies -------------------------------------------------------
+#
+# Moved ahead of the DRY_RUN staging below, which now needs the pinned tools
+# itself. Resolving them first also means a machine missing one fails before
+# anything has been created, rather than after.
+#
+# `command -v jq` and friends are gone. A probe answers a question about the
+# PATH at probe time and the bare-name call forty lines later re-answers it;
+# nothing made the two agree. wpm_require/wpm_optional resolve each tool ONCE
+# from a fixed absolute candidate list, hand it to the helper's `check-tool`
+# for the ownership/mode/parent-chain checks bash cannot do, and freeze it
+# into a readonly variable that every call site below uses by name.
+#
+# python3 needs no check here: sourcing the preamble already resolved and
+# validated it. It has always been a hard dependency of this script (the
+# fsync steps of the old finalize_shell_json shelled out to it, and
+# README.md lists it), but nothing checked for it, so a machine without
+# python3 failed MID-INSTALL, after shell.json had been touched.
+#
+# rsync is no longer a dependency at all -- see step 1.
+wpm_require AWK GREP
+wpm_optional JQ OMARCHY OMARCHY_SHELL
+
+if [[ -z $JQ ]]; then
+  printf >&2 '%s\n' \
+    "jq is required to edit shell.json safely and was not found." \
+    "" \
+    "    yay -S jq" \
+    ""
+  exit 1
+fi
+
+if [[ -z $OMARCHY ]]; then
+  printf >&2 '%s\n' \
+    "omarchy was not found at /usr/bin/omarchy or /usr/local/bin/omarchy." \
+    "This installer registers a plugin in ~/.config/omarchy/shell.json for" \
+    "Omarchy's Quickshell to load -- without Omarchy actually installed, that" \
+    "file being created/edited would look like a successful install while" \
+    "there is no shell around to ever load the plugin." \
+    ""
+  exit 1
+fi
+
+if [[ -z $OMARCHY_SHELL ]]; then
+  printf >&2 '%s\n' \
+    "Warning: omarchy-shell was not found at /usr/bin/omarchy-shell or" \
+    "/usr/local/bin/omarchy-shell. Installing will proceed, but the running" \
+    "shell will not pick up the new plugin until you restart it (or run" \
+    "omarchy-shell yourself once it is available)." \
+    ""
+fi
+
+# --- Where everything lives ------------------------------------------------
+#
+# Every filesystem operation below is expressed as a trusted ROOT plus a
+# relative path under it, because that is what the helper takes: it opens the
+# root once, validates it on the descriptor, then walks the relative path one
+# component at a time with O_NOFOLLOW. DRY_RUN is therefore exactly the root
+# substitution it always claimed to be -- $HOME for a real run, the staging
+# directory for a dry one -- and the same code runs either way.
+#
+# The absolute PLUGIN_DIR/SHELL_JSON/BIN_DIR/MENU_JSONC variables survive
+# because they are what the messages print and what the symlinks point at.
 if [[ $DRY_RUN == 1 ]]; then
-  STAGE="$(mktemp -d)"
-  PLUGIN_DIR="$STAGE/plugins/$PLUGIN_ID"
-  SHELL_JSON="$STAGE/shell.json"
-  mkdir -p "$STAGE/plugins" "$(dirname "$BIN_DIR")"
-  BIN_DIR="$STAGE/local-bin"
+  wpm_require MKTEMP SED
+
+  # The staging directory lives under $HOME rather than in /tmp. It has to:
+  # the helper refuses to treat a directory it cannot validate as a trusted
+  # root, and /tmp is mode 1777 and root-owned, so nothing rooted there can be
+  # created or torn down through it. $HOME is the root this script already
+  # keys everything else off.
+  STAGE="$("$MKTEMP" -d -p "$HOME" .wallpaper-monitor-dryrun.XXXXXXXXXX)"
+  STAGE_REL="${STAGE##*/}"
+
+  ROOT="$STAGE"
+  REL_PLUGIN_DIR="plugins/$PLUGIN_ID"
+  REL_SHELL_JSON="shell.json"
+  REL_BIN_DIR="local-bin"
+  REL_MENU_JSONC="extensions/omarchy-menu.jsonc"
+
+  PLUGIN_DIR="$STAGE/$REL_PLUGIN_DIR"
+  SHELL_JSON="$STAGE/$REL_SHELL_JSON"
+  MENU_JSONC="$STAGE/$REL_MENU_JSONC"
+
+  wpm_cfg mkdir-chain --root "$ROOT" --rel plugins --mode 0755
+  wpm_cfg mkdir-chain --root "$ROOT" --rel extensions --mode 0755
+  # Unchanged from before this migration: BIN_DIR was still the REAL
+  # ~/.local/bin at this point, so `mkdir -p "$(dirname "$BIN_DIR")"` created
+  # the real ~/.local. Kept as it was rather than quietly changed.
+  wpm_cfg mkdir-chain --root "$HOME" --rel .local --mode 0755
+  BIN_DIR="$STAGE/$REL_BIN_DIR"
+
   # Seed a shell.json so the dry run has something realistic to show a diff
-  # against, if a real one already exists; otherwise start from empty.
-  if [[ -f "$OMARCHY_CONFIG_DIR/shell.json" ]]; then
-    cp "$OMARCHY_CONFIG_DIR/shell.json" "$SHELL_JSON"
+  # against, if a real one already exists; otherwise start from empty. The
+  # real file's mode is carried across too, so the mode-preservation the real
+  # run performs is visible in the staged one.
+  seed_mode="$(stat_key "$HOME" ".config/omarchy/shell.json" mode)"
+  if [[ -n $seed_mode ]]; then
+    wpm_cfg install-file \
+      --src-root "$HOME" --src-rel ".config/omarchy/shell.json" \
+      --dst-root "$ROOT" --dst-rel "$REL_SHELL_JSON" \
+      --mode "$seed_mode" --max-bytes "$WPM_MAX_CONFIG_BYTES"
   else
-    printf '{}\n' >"$SHELL_JSON"
+    wpm_cfg edit --root "$ROOT" --rel "$REL_SHELL_JSON" --mode 0600 -- "$JQ" -n '{}' \
+      || wpm_die "could not create $SHELL_JSON"
   fi
   # Same for the menu extension file: seed the staging copy from the real one
   # (when it exists) so the dry run reports exactly what a real run would do
   # -- in particular whether our block is already present.
-  real_menu_jsonc="$MENU_JSONC"
-  MENU_JSONC="$STAGE/extensions/omarchy-menu.jsonc"
-  mkdir -p "$STAGE/extensions"
-  if [[ -f "$real_menu_jsonc" ]]; then
-    cp "$real_menu_jsonc" "$MENU_JSONC"
+  seed_mode="$(stat_key "$HOME" ".config/omarchy/extensions/omarchy-menu.jsonc" mode)"
+  if [[ -n $seed_mode ]]; then
+    wpm_cfg install-file \
+      --src-root "$HOME" --src-rel ".config/omarchy/extensions/omarchy-menu.jsonc" \
+      --dst-root "$ROOT" --dst-rel "$REL_MENU_JSONC" \
+      --mode "$seed_mode" --max-bytes "$WPM_MAX_CONFIG_BYTES"
   fi
   printf 'DRY RUN: no real files under ~/.config/omarchy or ~/.local/bin will be touched.\n'
   printf 'DRY RUN: staging in %s\n\n' "$STAGE"
 else
+  ROOT="$HOME"
+  REL_PLUGIN_DIR=".config/omarchy/plugins/$PLUGIN_ID"
+  REL_SHELL_JSON=".config/omarchy/shell.json"
+  REL_BIN_DIR=".local/bin"
+  REL_MENU_JSONC=".config/omarchy/extensions/omarchy-menu.jsonc"
+
   PLUGIN_DIR="$OMARCHY_CONFIG_DIR/plugins/$PLUGIN_ID"
   SHELL_JSON="$OMARCHY_CONFIG_DIR/shell.json"
 fi
 
-if ! command -v jq >/dev/null 2>&1; then
-  cat >&2 <<'MSG'
-jq is required to edit shell.json safely and was not found.
-
-    yay -S jq
-
-MSG
-  exit 1
-fi
-
-if ! command -v rsync >/dev/null 2>&1; then
-  cat >&2 <<'MSG'
-rsync is required to copy the plugin files and was not found.
-
-    yay -S rsync
-
-MSG
-  exit 1
-fi
-
-if ! command -v omarchy >/dev/null 2>&1; then
-  cat >&2 <<'MSG'
-omarchy was not found on PATH. This installer registers a plugin in
-~/.config/omarchy/shell.json for Omarchy's Quickshell to load -- without
-Omarchy actually installed, that file being created/edited would look like a
-successful install while there is no shell around to ever load the plugin.
-
-MSG
-  exit 1
-fi
-
-if ! command -v omarchy-shell >/dev/null 2>&1; then
-  cat >&2 <<'MSG'
-Warning: omarchy-shell is not on PATH. Installing will proceed, but the
-running shell will not pick up the new plugin until you restart it (or run
-omarchy-shell yourself once it is available).
-
-MSG
-fi
-
 # --- 1. Copy the plugin payload -------------------------------------------
 #
-# rsync rather than a symlink: omarchy-plugin-validate refuses symlinks
+# A copy rather than a symlink: omarchy-plugin-validate refuses symlinks
 # inside a plugin directory, and a stray edit to the installed copy should
 # not silently leak back into the git checkout (or vice versa).
 printf '==> installing plugin files to %s\n' "$PLUGIN_DIR"
 
-# Refuse a symlinked plugin directory before rsync --delete runs. `mkdir -p` is
-# a silent no-op on an existing symlink-to-directory, and rsync then follows it
-# and applies --delete INSIDE the link's target: every file there that is not
-# part of this plugin is erased. Reproduced with a link to a directory holding
-# unrelated files -- all of them were deleted by the first ./install.sh.
-# Omarchy's validator already refuses symlinks inside a plugin directory, so
-# there is no legitimate reason for this path to be one.
-if [[ -L $PLUGIN_DIR ]]; then
+# `rsync -a --delete` is gone, and pinning its path would not have been
+# enough: rsync re-resolves every pathname it is given inside a process we do
+# not control, so no descriptor can be held across the validation and the
+# copy. The scar below is that property showing up as a bug report -- a
+# symlinked plugin directory whose target's unrelated files `--delete` erased,
+# because `mkdir -p` is a silent no-op on a symlink-to-directory and rsync
+# then followed it.
+#
+# The copy half is now one `install-file` per allowlist entry and the
+# `--delete` half is one `prune-dir`, both descriptor-relative and both
+# driven by the SAME list, so they cannot disagree about what belongs here.
+# A symlink anywhere in the chain -- not merely at the final component, which
+# is all the `[[ -L ]]` test below could ever see -- makes the openat fail
+# with ELOOP and nothing is written.
+#
+# The test is kept because it produces a message a user can act on; it is no
+# longer what makes the operation safe.
+#
+# Assigned first and tested afterwards, never `[[ "$(stat_key ...)" == x ]]`:
+# a command substitution that fails INSIDE `[[ ]]` is invisible to errexit, so
+# a boundary refusal would read as "absent" and the script would carry on. In
+# an assignment the failure propagates and the run stops.
+plugin_dir_type="$(stat_key "$ROOT" "$REL_PLUGIN_DIR" type)"
+if [[ $plugin_dir_type == lnk ]]; then
   printf >&2 '%s\n' \
     "error: $PLUGIN_DIR is a symlink." \
-    "Refusing to install: rsync --delete would erase the contents of whatever" \
-    "it points at ($(readlink -- "$PLUGIN_DIR"))." \
+    "Refusing to install: the plugin directory must be a real directory," \
+    "not a link into somebody else's tree." \
     "Remove or move the symlink aside, then run this installer again."
   exit 1
 fi
-mkdir -p "$PLUGIN_DIR"
 
-# ALLOWLIST, not a list of exclusions. The payload is exactly the files the
-# plugin needs at runtime, and anything new in the repo is NOT installed unless
-# it is named here.
+# ALLOWLIST, not a list of exclusions -- now WPM_PAYLOAD in
+# bin/wallpaper-monitor-common.sh, shared with the prune below so the two
+# cannot drift apart, and carrying each file's mode so the executable bit
+# travels with the entry instead of a separate `chmod +x` that can go stale.
+# The payload is exactly the files the plugin needs at runtime, and anything
+# new in the repo is NOT installed unless it is named there.
 #
 # This used to be a deny-list, which shipped whatever nobody had thought to
 # exclude. That is how a maintainer-only file that has no business on an
@@ -227,162 +396,161 @@ mkdir -p "$PLUGIN_DIR"
 # deny-list cannot fix the class of bug -- the next such file ships the same
 # way, by omission.
 # An allowlist fails closed instead: a new file is left out until someone
-# adds it deliberately.
+# adds it deliberately. It fails closed in the other direction too -- a file
+# named in the list but missing from the repo aborts the install loudly
+# rather than being skipped into a half-installed plugin.
 #
-# `--include` order matters: directories must be included before their
-# contents, and the final `--exclude '*'` drops everything unnamed.
-rsync -a --delete \
-  --include 'Background.qml' \
-  --include 'manifest.json' \
-  --include 'install.sh' \
-  --include 'uninstall.sh' \
-  --include 'README.md' \
-  --include 'LICENSE' \
-  --include 'bin/' \
-  --include 'bin/wallpaper-monitor' \
-  --include 'bin/wp' \
-  --include 'bin/wallpaper-monitor-menu' \
-  --exclude '*' \
-  "$HERE"/ "$PLUGIN_DIR"/
-chmod +x "$PLUGIN_DIR/bin/wallpaper-monitor" "$PLUGIN_DIR/bin/wp" "$PLUGIN_DIR/bin/wallpaper-monitor-menu"
+# The destination directories are created here at 0755 rather than left to
+# install-file, which would create a missing parent at 0700: `mkdir -p` under
+# the default umask and `rsync -a` copying the repo's own bin/ both produced
+# 0755, and a plugin directory the shell has to read is not the place to
+# silently narrow a mode.
+wpm_cfg mkdir-chain --root "$ROOT" --rel "$REL_PLUGIN_DIR" --mode 0755
+declare -A payload_dirs=()
+for entry in "${WPM_PAYLOAD[@]}"; do
+  payload_rel="${entry%:*}"
+  if [[ $payload_rel == */* ]]; then
+    payload_dirs["${payload_rel%/*}"]=1
+  fi
+done
+for payload_dir in "${!payload_dirs[@]}"; do
+  wpm_cfg mkdir-chain --root "$ROOT" --rel "$REL_PLUGIN_DIR/$payload_dir" --mode 0755
+done
+
+# Entries named in WPM_PAYLOAD that this installer must NOT copy, each with
+# its reason. Deliberately a short by-name list and NOT a "skip whatever is
+# missing" rule: the allowlist has to fail closed in both directions, so a
+# payload file absent for any other reason still aborts the install loudly
+# below rather than producing a half-installed plugin.
+#
+#   BoundedProcess.qml -- never created. The bounded process supervision it
+#     was going to hold is inlined in Background.qml instead, because sibling
+#     QML type resolution is unverified for this Quickshell version and an
+#     unresolvable type fails the WHOLE component at load -- i.e. no wallpaper
+#     at all. That is the fallback DESIGN.md section 8 names, and what the
+#     approved reference Panel.qml does. The entry belongs out of WPM_PAYLOAD;
+#     until it is removed there, it is skipped here, by name, with a reason.
+payload_skip=" BoundedProcess.qml "
+
+payload_keep=()
+for entry in "${WPM_PAYLOAD[@]}"; do
+  payload_rel="${entry%:*}"
+  payload_mode="${entry##*:}"
+  if [[ $payload_skip == *" $payload_rel "* ]]; then
+    continue
+  fi
+  payload_keep+=(--keep "$payload_rel")
+  wpm_cfg install-file \
+    --src-root "$HERE" --src-rel "$payload_rel" \
+    --dst-root "$ROOT" --dst-rel "$REL_PLUGIN_DIR/$payload_rel" \
+    --mode "$payload_mode" \
+    || wpm_die "could not install $payload_rel -- it is named in WPM_PAYLOAD but could not be copied from $HERE"
+done
+
+# The `--delete` half of the old rsync: everything in the installed plugin
+# directory that the allowlist does not name goes, so an upgrade that drops a
+# file does not leave it behind.
+wpm_cfg prune-dir --root "$ROOT" --rel "$REL_PLUGIN_DIR" "${payload_keep[@]}" >/dev/null \
+  || wpm_die "could not remove stale files from $PLUGIN_DIR"
 
 # --- 1b. Pre-flight check that all symlinks CAN be created -----------------
 #
 # Deliberately done before touching shell.json (step 2&3 below). shell.json
-# edits and symlink creation are not one atomic transaction, and jq/mv on
-# shell.json has no rollback -- so if a later link_one call died (e.g. an
+# edits and symlink creation are not one atomic transaction, and the shell.json
+# edit has no rollback -- so if a later link_one call died (e.g. an
 # unrelated ~/.local/bin/wp from another tool), the user would be left with
 # shell.json already pointing at this plugin and the native background
 # already disabled, but the CLI not actually reachable, with an error message
 # that never mentions shell.json was touched. Running a side-effect-free dry
 # pass over all 3 links first means the real work in step 4 either succeeds
 # for all of them or step 2&3 never runs at all.
+#
+# This pass and link_one below are what the shell.json transaction sits
+# between, which used to make it the widest validate-then-reuse window in the
+# repo: `[[ -e ]]`/`[[ -L ]]` here, `ln -s` two hundred lines later, both by
+# pathname. It is still a pre-flight -- its job is the error message -- but
+# the creation itself now goes through `symlink`, which resolves the parent
+# directory descriptor-relatively at the moment it acts.
 check_link_one() {
   local name=$1
   local target="$PLUGIN_DIR/bin/$name"
   local link="$BIN_DIR/$name"
+  local kind
+  kind="$(stat_key "$ROOT" "$REL_BIN_DIR/$name" type)"
 
-  if [[ -e $link || -L $link ]]; then
+  if [[ $kind != absent ]]; then
     # Our own symlink (live or dangling) is fine -- link_one in step 4 will
-    # either skip it (already correct) or replace it (dangling/stale).
-    if [[ -L $link ]]; then
+    # either skip it (already correct) or report it.
+    if [[ $kind == lnk ]]; then
       return 0
     fi
 
-    cat >&2 <<MSG
-$link already exists and is not this plugin's symlink.
-
-Refusing to install. Nothing has been changed yet -- shell.json and the
-plugin's other symlinks are untouched. Move $link aside first, or skip the
-symlink step and call the plugin's bin/ directly:
-
-    $target
-
-MSG
+    printf >&2 '%s\n' \
+      "$link already exists and is not this plugin's symlink." \
+      "" \
+      "Refusing to install. Nothing has been changed yet -- shell.json and the" \
+      "plugin's other symlinks are untouched. Move $link aside first, or skip the" \
+      "symlink step and call the plugin's bin/ directly:" \
+      "" \
+      "    $target" \
+      ""
     exit 1
   fi
 }
 
-mkdir -p "$BIN_DIR"
+wpm_cfg mkdir-chain --root "$ROOT" --rel "$REL_BIN_DIR" --mode 0755
 check_link_one wallpaper-monitor
 check_link_one wp
 check_link_one wallpaper-monitor-menu
 
 # --- 2 & 3. Register the plugin and disable the native one ----------------
 #
-# Preserves the target's existing permission mode (mktemp always creates the
-# temp file 0600, and a plain `mv` would carry that into shell.json) and
-# fsyncs the temp file + its directory before and after the rename, so the
-# write is durable and not just atomic-for-visibility. Same approach as
-# bin/wallpaper-monitor's write_atomic(): chmod before rename, fsync(file)
-# before rename, fsync(dir) after.
-finalize_shell_json() {
-  local tmp=$1
-  local dest=$2
-  local dir
-  dir="$(dirname "$dest")"
-
-  # A symlink here is refused rather than followed. `[[ -f ]]` is true for a
-  # symlink to a regular file, and `stat` without -L reports the LINK's own
-  # mode (0777 on Linux), which chmod would then stamp onto the real file this
-  # function creates -- a world-writable shell.json, editable by any local
-  # user, from a config the shell loads at startup. The rename would also
-  # replace the user's link with a regular file, and the caller's backup would
-  # have copied the link target's contents to a predictable path. None of that
-  # is recoverable automatically, so stop and let the user decide.
-  if [[ -L $dest ]]; then
-    printf >&2 '%s\n' \
-      "error: $dest is a symlink." \
-      "Refusing to replace it: this would create a regular file with the" \
-      "symlink's own permissions and discard the link." \
-      "Resolve it to a regular file first, then run this again."
-    exit 1
-  fi
-
-  # New file (fresh install, no prior shell.json) gets 0600 -- same default
-  # write_atomic() picks when stat() fails. An existing file keeps its own
-  # mode instead of silently inheriting mktemp's 0600.
-  local mode=600
-  if [[ -f $dest ]]; then
-    mode="$(stat -c %a -- "$dest")"
-  fi
-  chmod "$mode" "$tmp"
-
-  # fsync the temp file's contents, THEN rename, THEN fsync the directory.
-  # rename(2) is atomic for visibility (a reader never sees a half-written
-  # file) but says nothing about durability -- without this, a power cut
-  # right after install/uninstall can leave the rename durable while the
-  # data behind it is not, corrupting the file the whole shell reads at
-  # startup. A failure here must abort before the rename, not be swallowed:
-  # under `set -e` a non-zero exit from python3 does exactly that.
-  python3 -c '
-import os
-import sys
-
-tmp_path = sys.argv[1]
-fd = os.open(tmp_path, os.O_RDONLY)
-try:
-    os.fsync(fd)
-finally:
-    os.close(fd)
-' "$tmp"
-
-  mv "$tmp" "$dest"
-
-  python3 -c '
-import os
-import sys
-
-directory = sys.argv[1]
-dfd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
-try:
-    os.fsync(dfd)
-finally:
-    os.close(dfd)
-' "$dir"
-}
+# finalize_shell_json() is gone, and so is the mktemp/jq/mv dance around it.
+# It refused a symlinked destination, read the destination's mode with `stat`,
+# chmod'ed the temp, renamed, and then fsynced the directory -- five separate
+# resolutions of the same pathname, with the jq run in the middle of them, and
+# a `mktemp -p ... .shell.json.XXXXXX` temp name whose six random characters
+# and fixed prefix were the predictable staging name the review blocked.
+#
+# All of it is now one `edit` transaction: the helper opens the parent
+# directory by walking it component by component with O_NOFOLLOW, holds THAT
+# descriptor for the whole operation, snapshots the target on its own
+# descriptor, runs the jq program below as a pure stdin->stdout filter,
+# stages the result under an unpredictable 128-bit name in the same
+# directory, re-checks that the target is still byte-for-byte the object it
+# snapshotted, and only then renames through the descriptor it has held all
+# along. The destination's existing mode is preserved from that validated
+# descriptor rather than from a pathname `stat` (which reports 0777 for a
+# symlink and would have stamped it onto the real file); a group- or
+# other-writable destination is refused outright instead of having its mode
+# copied forward.
 
 # Back up shell.json before touching it -- it is hand-edited, human-owned
 # config, not something regenerated on demand.
-if [[ -f $SHELL_JSON ]]; then
-  # %N (nanoseconds, GNU date) rather than second resolution: two installs
-  # run back-to-back (e.g. testing idempotency, or a script driving this)
-  # can land in the same second, and second-resolution backups would then
-  # silently clobber each other -- losing the backup of the ORIGINAL state.
-  BACKUP="$SHELL_JSON.bak.$(date +%Y%m%d-%H%M%S-%N)"
-  cp "$SHELL_JSON" "$BACKUP"
+shell_json_type="$(stat_key "$ROOT" "$REL_SHELL_JSON" type)"
+if [[ $shell_json_type != absent ]]; then
+  # Sub-second resolution rather than whole seconds: two installs run
+  # back-to-back (e.g. testing idempotency, or a script driving this) can land
+  # in the same second, and second-resolution backups would then silently
+  # clobber each other -- losing the backup of the ORIGINAL state.
+  BACKUP_SUFFIX=".bak.$(backup_stamp)"
+  BACKUP="$SHELL_JSON$BACKUP_SUFFIX"
+  shell_json_mode="$(stat_key "$ROOT" "$REL_SHELL_JSON" mode)"
+  wpm_cfg install-file \
+    --src-root "$ROOT" --src-rel "$REL_SHELL_JSON" \
+    --dst-root "$ROOT" --dst-rel "$REL_SHELL_JSON$BACKUP_SUFFIX" \
+    --mode "$shell_json_mode" \
+    --max-bytes "$WPM_MAX_CONFIG_BYTES" \
+    || wpm_die "could not back up $SHELL_JSON; if it is group- or other-writable, chmod go-w it first"
   printf '==> backed up %s -> %s\n' "$SHELL_JSON" "$BACKUP"
 else
-  printf '{}\n' >"$SHELL_JSON"
+  # A shell.json this installer creates itself is 0600, which is what
+  # finalize_shell_json always said it would be. An existing one keeps its own
+  # mode, whatever it is.
+  wpm_cfg edit --root "$ROOT" --rel "$REL_SHELL_JSON" --mode 0600 -- "$JQ" -n '{}' \
+      || wpm_die "could not create $SHELL_JSON"
 fi
 
-# Temp file in the DESTINATION directory, not /tmp: on this system /tmp is
-# tmpfs and $HOME is btrfs, so `mv` across them is copy+unlink, not an atomic
-# rename. A crash mid-copy would leave a TRUNCATED shell.json -- which is the
-# file the whole shell reads at startup. Same directory means same filesystem
-# means rename(2), which is atomic: readers see either the old file or the new
-# one, never half of one.
-TMP_JSON="$(mktemp -p "$(dirname "$SHELL_JSON")" .shell.json.XXXXXX)"
 # plugins[] entries are objects ({"id": "..."}, sometimes with extra
 # per-plugin settings alongside), not bare strings -- confirmed against a
 # real shell.json. disabledPlugins[] is a flat string array. Dedupe plugins[]
@@ -449,7 +617,15 @@ TMP_JSON="$(mktemp -p "$(dirname "$SHELL_JSON")" .shell.json.XXXXXX)"
 #      foreign clone's claim and then re-enable the native to draw over it.
 #      We still disable the native (idempotent no-op here) because we need it
 #      off to run; we simply do not assert ownership of that state.
-jq \
+#
+# The jq program is byte-identical to the one that used to read $SHELL_JSON by
+# name and redirect into a temp file; it is now handed the file's contents on
+# stdin by the transaction above and its stdout is the new contents.
+# shellcheck disable=SC2016  # jq/awk program text -- the single quotes are
+# what keep $plugin / $0 as the filter's own variables, not the shell's.
+wpm_cfg edit --root "$ROOT" --rel "$REL_SHELL_JSON" --mode 0600 \
+  --max-bytes "$WPM_MAX_CONFIG_BYTES" -- \
+  "$JQ" \
   --arg plugin "$PLUGIN_ID" \
   --arg native "$NATIVE_PLUGIN_ID" \
   '
@@ -470,15 +646,7 @@ jq \
   (if (.cloneSourceRestores | length) == 0
    then del(.cloneSourceRestores) else . end)
   ' \
-  "$SHELL_JSON" >"$TMP_JSON"
-# jq wrote through the shell's redirection, which opened $TMP_JSON at
-# mktemp's mode 0600 -- a plain `mv` would carry that mode into $SHELL_JSON,
-# silently narrowing it if the user's file was e.g. 0644. fsync both the file
-# and its directory before the rename lands, matching the durability
-# discipline bin/wallpaper-monitor's write_atomic() uses for the same reason:
-# rename(2) is atomic for visibility but not for durability, and this is the
-# file the whole shell reads at startup.
-finalize_shell_json "$TMP_JSON" "$SHELL_JSON"
+  || wpm_die "could not update $SHELL_JSON; if it is group- or other-writable, chmod go-w it first"
 printf '==> registered %s and disabled %s in %s\n' "$PLUGIN_ID" "$NATIVE_PLUGIN_ID" "$SHELL_JSON"
 
 # --- 4. Symlink the CLIs into ~/.local/bin ---------------------------------
@@ -489,45 +657,57 @@ printf '==> registered %s and disabled %s in %s\n' "$PLUGIN_ID" "$NATIVE_PLUGIN_
 link_one() {
   local name=$1
   local target="$PLUGIN_DIR/bin/$name"
+  local rel_link="$REL_BIN_DIR/$name"
   local link="$BIN_DIR/$name"
+  local kind resolved rc
 
-  if [[ -e $link || -L $link ]]; then
-    if [[ -L $link && $(readlink -f "$link") == "$(readlink -f "$target")" ]]; then
-      printf 'already linked: %s\n' "$link"
-      return 0
-    fi
+  kind="$(stat_key "$ROOT" "$rel_link" type)"
+  if [[ $kind != absent ]]; then
+    # `readlink -f` is replaced by `resolve-link`, which re-anchors and
+    # re-validates the parent chain at every hop instead of handing the whole
+    # pathname to the kernel once. --require-regular is what tells a live
+    # link from a dangling one: a dangling chain comes back as exit 4.
+    rc=0
+    resolved="$(wpm_cfg resolve-link --root "$ROOT" --rel "$rel_link" \
+                  --max-hops 4 --require-regular 2>/dev/null)" || rc=$?
 
-    # A dangling symlink of our own name is almost always this installer's
-    # earlier work, from a plugin folder that has since moved or been
-    # reinstalled. Treated as a foreign file, it would refuse to replace a
-    # dead link nothing else can repair. Say what it is and offer the fix.
-    if [[ -L $link && ! -e $link ]]; then
-      cat >&2 <<MSG
-$link is a broken symlink, pointing at:
-
-    $(readlink "$link")
-
-That target no longer exists. Clear it before installing again:
-
-    rm -f "$link" && "$HERE/install.sh"
-
-MSG
+    if [[ $rc == 0 ]]; then
+      if [[ $kind == lnk && $resolved == "$target" ]]; then
+        printf 'already linked: %s\n' "$link"
+        return 0
+      fi
+    elif [[ $rc == 4 && $kind == lnk ]]; then
+      # A dangling symlink of our own name is almost always this installer's
+      # earlier work, from a plugin folder that has since moved or been
+      # reinstalled. Treated as a foreign file, it would refuse to replace a
+      # dead link nothing else can repair. Say what it is and offer the fix.
+      resolved="$(wpm_cfg resolve-link --root "$ROOT" --rel "$rel_link" --max-hops 4)" \
+        || resolved="(could not be resolved safely)"
+      printf >&2 '%s\n' \
+        "$link is a broken symlink, pointing at:" \
+        "" \
+        "    $resolved" \
+        "" \
+        "That target no longer exists. Clear it before installing again:" \
+        "" \
+        "    rm -f \"$link\" && \"$HERE/install.sh\"" \
+        ""
       exit 1
     fi
 
-    cat >&2 <<MSG
-$link already exists and is not this plugin's symlink.
-
-Refusing to replace it. Move it aside first, or skip the symlink step and
-call the plugin's bin/ directly:
-
-    $target
-
-MSG
+    printf >&2 '%s\n' \
+      "$link already exists and is not this plugin's symlink." \
+      "" \
+      "Refusing to replace it. Move it aside first, or skip the symlink step and" \
+      "call the plugin's bin/ directly:" \
+      "" \
+      "    $target" \
+      ""
     exit 1
   fi
 
-  ln -s "$target" "$link"
+  wpm_cfg symlink --root "$ROOT" --rel "$rel_link" --target "$target" \
+    || wpm_die "could not create the symlink $link"
   printf 'linked %s -> %s\n' "$link" "$target"
 }
 
@@ -550,23 +730,38 @@ link_one wallpaper-monitor-menu
 # it through jq/python would either fail outright or -- worse -- succeed and
 # silently write back a normalized file with every one of the user's comments
 # deleted. So we only ever append or cut a block delimited by our own comment
-# markers, leaving every other byte exactly as it was.
+# markers, leaving every other byte exactly as it was. That is still true
+# here: the awk program below is handed the file's bytes on stdin and its
+# stdout becomes the file's new bytes.
 #
 # Idempotent: a run that finds the markers already present changes nothing.
 # Reversible: uninstall.sh cuts the same marker block back out.
 add_menu_entry() {
-  local dir
-  dir="$(dirname "$MENU_JSONC")"
-  mkdir -p "$dir"
+  local menu_text menu_type menu_mode
+  wpm_cfg mkdir-chain --root "$ROOT" --rel "${REL_MENU_JSONC%/*}" --mode 0755
 
   # Nothing to merge into yet -- create the minimal valid JSONC object. (The
-  # file Omarchy ships as an example is all comments plus an empty {}.)
-  if [[ ! -f $MENU_JSONC ]]; then
-    printf '{\n}\n' >"$MENU_JSONC"
+  # file Omarchy ships as an example is all comments plus an empty {}.) 0644
+  # is the mode the shell redirection that used to do this produced under the
+  # default umask, and this file outlives the plugin, so it keeps it.
+  menu_type="$(stat_key "$ROOT" "$REL_MENU_JSONC" type)"
+  if [[ $menu_type == absent ]]; then
+    wpm_cfg edit --root "$ROOT" --rel "$REL_MENU_JSONC" --mode 0644 -- \
+      "$AWK" 'BEGIN { printf "{\n}\n" }' \
+      || wpm_die "could not create $MENU_JSONC"
     printf '==> created %s\n' "$MENU_JSONC"
   fi
 
-  if grep -qF "$MENU_MARK_BEGIN" "$MENU_JSONC"; then
+  # One bounded, no-follow read feeds every test below, instead of grep, awk
+  # and sed each opening the pathname again. The file is refused here on the
+  # same terms the edit would refuse it (symlink, not a regular file, not
+  # ours, group/other-writable, over budget), so a file we cannot safely edit
+  # is never even inspected.
+  menu_text="$(wpm_cfg read --root "$ROOT" --rel "$REL_MENU_JSONC" \
+                 --max-bytes "$WPM_MAX_CONFIG_BYTES")" \
+    || wpm_die "could not read $MENU_JSONC safely"
+
+  if "$GREP" -qF -- "$MENU_MARK_BEGIN" <<<"$menu_text"; then
     printf 'menu entry already present in %s\n' "$MENU_JSONC"
     return 0
   fi
@@ -576,41 +771,41 @@ add_menu_entry() {
   # guess if there is no closing brace to insert before -- appending after it
   # would produce a file the shell cannot parse, silently killing the user's
   # own menu extensions along with ours.
-  if ! awk '{ l = $0
+  # shellcheck disable=SC2016  # jq/awk program text -- the single quotes are
+  # what keep $plugin / $0 as the filter's own variables, not the shell's.
+  if ! "$AWK" '{ l = $0
               sub(/\r$/, "", l); sub(/^\xef\xbb\xbf/, "", l)
               gsub(/^[ \t]+|[ \t]+$/, "", l)
               if (l == "{") { ok = 1; exit } }
-            END { exit !ok }' "$MENU_JSONC"; then
-    cat >&2 <<MSG
-$MENU_JSONC has no line containing just the opening "{" -- it does not look
-like the JSONC object this installer knows how to extend. Refusing to edit it.
-
-Everything else was installed. To add the menu row by hand, put this line
-inside the top-level object of that file:
-
-$(menu_entry_line)
-
-MSG
+            END { exit !ok }' <<<"$menu_text"; then
+    printf >&2 '%s\n' \
+      "$MENU_JSONC has no line containing just the opening \"{\" -- it does not look" \
+      "like the JSONC object this installer knows how to extend. Refusing to edit it." \
+      "" \
+      "Everything else was installed. To add the menu row by hand, put this line" \
+      "inside the top-level object of that file:" \
+      "" \
+      "$(menu_entry_line)" \
+      ""
     return 0
   fi
 
   # Back up before touching a hand-edited, human-owned file -- same rule and
-  # same nanosecond-resolution timestamp as the shell.json backup above.
-  #
-  # Declared and assigned separately (SC2155): `local x="$(cmd)"` takes the
-  # exit status of `local`, which is always 0, so a failing date would be
-  # swallowed and the backup would land on a truncated name.
-  local backup
-  backup="$MENU_JSONC.bak.$(date +%Y%m%d-%H%M%S-%N)"
-  cp "$MENU_JSONC" "$backup"
+  # same sub-second timestamp as the shell.json backup above. The backup is a
+  # descriptor-relative copy now rather than a `cp` that followed symlinks
+  # onto a predictable path, and it carries the source's own validated mode.
+  local backup_suffix backup
+  backup_suffix=".bak.$(backup_stamp)"
+  backup="$MENU_JSONC$backup_suffix"
+  menu_mode="$(stat_key "$ROOT" "$REL_MENU_JSONC" mode)"
+  wpm_cfg install-file \
+    --src-root "$ROOT" --src-rel "$REL_MENU_JSONC" \
+    --dst-root "$ROOT" --dst-rel "$REL_MENU_JSONC$backup_suffix" \
+    --mode "$menu_mode" \
+    --max-bytes "$WPM_MAX_CONFIG_BYTES" \
+    || wpm_die "could not back up $MENU_JSONC; if it is group- or other-writable, chmod go-w it first"
   printf '==> backed up %s -> %s\n' "$MENU_JSONC" "$backup"
 
-  # temp + mv, so a failure part-way through never leaves a truncated menu
-  # file behind (an unparseable one costs the user their whole menu).
-  # Same reason as TMP_JSON above: temp file in the DESTINATION directory, so
-  # the mv is an atomic rename(2). A truncated omarchy-menu.jsonc costs the
-  # user their whole menu.
-  TMP_MENU="$(mktemp -p "$(dirname "$MENU_JSONC")" .omarchy-menu.jsonc.XXXXXX)"
   # Insert right AFTER the opening "{", not before the final "}".
   #
   # Inserting at the end looks natural and is wrong: the line would land after
@@ -625,32 +820,46 @@ MSG
   # After the "{" none of these cases exist: our line already ends in a
   # comma, and a trailing comma before "}" is legal in JSONC -- Omarchy's own
   # stripJsonc removes it.
-  awk -v blk="$(menu_entry_block)" '
+  #
+  # The awk program is byte-identical to the one that used to read the file by
+  # name and redirect into a mktemp'ed temp file. It is a pure stdin->stdout
+  # filter inside the same transaction the shell.json write uses: the
+  # destination's mode is preserved from its own validated descriptor, the
+  # staged copy has an unpredictable name, the target is re-checked
+  # immediately before the rename, and the rename and both fsyncs go through
+  # the one directory descriptor held throughout. awk exiting 3 (no standalone
+  # "{" after all) aborts the transaction before anything is written.
+  local rc=0
+  # shellcheck disable=SC2016  # jq/awk program text -- the single quotes are
+  # what keep $plugin / $0 as the filter's own variables, not the shell's.
+  wpm_cfg edit --root "$ROOT" --rel "$REL_MENU_JSONC" \
+         --max-bytes "$WPM_MAX_CONFIG_BYTES" -- \
+         "$AWK" -v blk="$(menu_entry_block)" '
     !ins { l = $0
            sub(/\r$/, "", l); sub(/^\xef\xbb\xbf/, "", l)
            gsub(/^[ \t]+|[ \t]+$/, "", l)
            if (l == "{") { print; print blk; ins = 1; next } }
     { print }
     END { if (!ins) exit 3 }
-  ' "$MENU_JSONC" >"$TMP_MENU" || {
-    rm -f "$TMP_MENU"; TMP_MENU=""
+  ' || rc=$?
+  # Exit 3 is the helper's "the filter exited non-zero" -- i.e. awk's exit 3
+  # above, the no-standalone-"{" case this branch has always reported and
+  # survived. Anything else is a boundary refusal (symlink, wrong owner,
+  # group/other-writable, over budget) and must not be reported as a parse
+  # problem, so it stays fatal. Nothing was written either way.
+  if (( rc == 3 )); then
     printf 'refused: %s has no standalone opening "{" -- left untouched\n' \
       "$MENU_JSONC" >&2
     return 0
-  }
-  # Same finalizer the shell.json write uses: preserve the destination's mode
-  # instead of inheriting mktemp's 0600, fsync the file, rename, fsync the
-  # directory. A plain `mv` here used to narrow a user's 0644
-  # omarchy-menu.jsonc to 0600 -- the identical defect finalize_shell_json was
-  # written to fix, which this write simply never adopted.
-  finalize_shell_json "$TMP_MENU" "$MENU_JSONC"
-  TMP_MENU=""
+  elif (( rc != 0 )); then
+    wpm_die "could not update $MENU_JSONC; if it is group- or other-writable, chmod go-w it first"
+  fi
   printf '==> added menu entry to %s\n' "$MENU_JSONC"
 }
 
 add_menu_entry
 
-case ":$PATH:" in
+case ":$WPM_LOGIN_PATH:" in
   *":$BIN_DIR:"*) ;;
   *) printf 'note: %s is not on your PATH\n' "$BIN_DIR" >&2 ;;
 esac
@@ -661,10 +870,13 @@ if [[ $DRY_RUN == 1 ]]; then
   # cloneSourceRestores is projected too: it is now one of the three arrays
   # this installer writes, and a preview that hid it would hide the very field
   # that makes uninstall able to restore the native background.
-  jq '{plugins, disabledPlugins, cloneSourceRestores}' "$SHELL_JSON"
+  "$JQ" '{plugins, disabledPlugins, cloneSourceRestores}' \
+    <<<"$(wpm_cfg read --root "$ROOT" --rel "$REL_SHELL_JSON" --max-bytes "$WPM_MAX_CONFIG_BYTES")"
   printf '\nResulting menu extension block:\n'
-  if [[ -f $MENU_JSONC ]]; then
-    sed -n "/$(printf '%s' "$MENU_MARK_BEGIN" | sed 's/[][\.*^$/]/\\&/g')/,/$(printf '%s' "$MENU_MARK_END" | sed 's/[][\.*^$/]/\\&/g')/p" "$MENU_JSONC"
+  menu_preview="$(wpm_cfg read --root "$ROOT" --rel "$REL_MENU_JSONC" \
+                    --max-bytes "$WPM_MAX_CONFIG_BYTES" --allow-missing)"
+  if [[ -n $menu_preview ]]; then
+    "$SED" -n "/$(printf '%s' "$MENU_MARK_BEGIN" | "$SED" 's/[][\.*^$/]/\\&/g')/,/$(printf '%s' "$MENU_MARK_END" | "$SED" 's/[][\.*^$/]/\\&/g')/p" <<<"$menu_preview"
   fi
 else
   printf '\nInstalled. Restart omarchy-shell (or your session) to load the plugin.\n'
