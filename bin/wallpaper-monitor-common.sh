@@ -285,6 +285,8 @@ export WPM_PLUGIN_ID WPM_NATIVE_PLUGIN_ID WPM_CLI WPM_MAX_CONFIG_BYTES \
 # A bash array cannot be exported (the environment holds strings only), so this
 # is readonly but not exported. Every consumer sources this file, so every
 # consumer has it.
+# shellcheck disable=SC2034  # consumed by install.sh / uninstall.sh, which
+# source this file; an array cannot be exported, so shellcheck cannot see it.
 WPM_PAYLOAD=(
   "manifest.json:0644"
   "Background.qml:0644"
@@ -299,6 +301,7 @@ WPM_PAYLOAD=(
   "bin/wallpaper-monitor-common.sh:0644"
   "bin/wallpaper-monitor-config.py:0644"
 )
+# shellcheck disable=SC2034  # see above
 readonly WPM_PAYLOAD
 
 # --- 5. The tool table ----------------------------------------------------
@@ -481,8 +484,8 @@ wpm_map_exit() {
 # call wpm_require / wpm_optional.
 _wpm_resolve() {
   local required=$1; shift
-  local name candidate picked rc
-  local -a staged=() staged_names=()
+  local name candidate picked index
+  local -a staged=() staged_names=() args=()
 
   for name in "$@"; do
     # Idempotent: a name resolved by an earlier call is already readonly, so
@@ -511,8 +514,11 @@ _wpm_resolve() {
 
     if [[ -z $picked ]]; then
       if (( required )); then
-        wpm_die "$name: no usable executable found; tried:${WPM_TOOL_CANDIDATES[$name]// / }"
+        wpm_die "$name: no usable executable found; tried: ${WPM_TOOL_CANDIDATES[$name]}"
       fi
+      # Optional and absent: freeze it EMPTY so a caller's `[[ -n $FILE ]]`
+      # test is well defined under `set -u`, and so a later wpm_require for
+      # the same name fails loudly instead of silently re-probing.
       export "$name="
       readonly "$name"
       WPM_TOOL_RESOLVED[$name]=1
@@ -524,12 +530,23 @@ _wpm_resolve() {
 
   (( ${#staged[@]} )) || return 0
 
+  # The interpreter is the one tool that cannot be validated before it is
+  # usable, because check-tool runs inside it. Seed it here, unfrozen, so the
+  # validation below can run; the freeze happens with all the others.
+  index=0
+  for candidate in "${staged[@]}"; do
+    [[ ${staged_names[index]} == PYTHON3 && -z ${PYTHON3:-} ]] && PYTHON3=$candidate
+    index=$(( index + 1 ))
+  done
+  if [[ -z ${PYTHON3:-} ]]; then
+    wpm_die "PYTHON3 must be resolved before any other tool"
+  fi
+
   # Authoritative validation, batched into ONE helper invocation: regular
   # file, executable, owner in {root, us}, no group/other write bit, and every
   # parent from / walked O_NOFOLLOW under the same ownership and mode rule --
   # none of which bash can test. A symlinked final component is followed for
   # at most 8 hops, re-validating the whole chain at each one.
-  local -a args=()
   for candidate in "${staged[@]}"; do
     args+=(--path "$candidate")
   done
@@ -537,18 +554,18 @@ _wpm_resolve() {
     # The batch says only THAT something failed. Re-check one at a time to
     # name the culprit -- the failure path is allowed to be slow, the success
     # path is the one that stays at a single helper spawn.
-    local index=0
+    index=0
     for candidate in "${staged[@]}"; do
       if ! wpm_cfg check-tool --path "$candidate" >/dev/null 2>&1; then
         name=${staged_names[index]}
-        wpm_die "$name: $candidate failed validation; tried:${WPM_TOOL_CANDIDATES[$name]// / }"
+        wpm_die "$name: $candidate failed validation; tried: ${WPM_TOOL_CANDIDATES[$name]}"
       fi
       index=$(( index + 1 ))
     done
     wpm_die "tool validation failed"
   fi
 
-  local index=0
+  index=0
   for candidate in "${staged[@]}"; do
     name=${staged_names[index]}
     export "$name=$candidate"
@@ -622,7 +639,7 @@ wpm_bounded() {
     return 2
   fi
   shift
-  if [[ $max != [1-9]*([0-9]) || $secs != [1-9]*([0-9]) ]]; then
+  if [[ ! $max =~ ^[1-9][0-9]*$ || ! $secs =~ ^[1-9][0-9]*$ ]]; then
     wpm_warn "wpm_bounded: MAX and SECS must be positive integers"
     return 2
   fi
@@ -633,12 +650,12 @@ wpm_bounded() {
     -- "$@"
 }
 
-# `[[ $max != [1-9]*([0-9]) ]]` above needs extglob. Enabled here rather than
-# left to the caller so the guard cannot silently degrade into a literal match.
-shopt -s extglob
-
-export -f wpm_warn wpm_die wpm_cfg wpm_map_exit wpm_require wpm_optional \
-          wpm_bounded _wpm_resolve
+# The functions above are deliberately NOT `export -f`'d. Section 0 unsets every
+# exported function it finds, so exporting ours would only mean they are stripped
+# again by the next script in the chain -- while in the meantime injecting
+# BASH_FUNC_wpm_die and friends into the environment of every unrelated child we
+# exec, which is the exact mechanism section 0 exists to close. Each of the five
+# scripts sources this file itself; subshells inherit functions without export.
 
 # --- 7. Bootstrap the interpreter ----------------------------------------
 # PYTHON3 must exist before anything else can be validated, since check-tool
