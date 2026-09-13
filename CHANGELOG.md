@@ -4,6 +4,17 @@ All notable changes to Omarchy Wallpaper Per Monitor are documented here.
 
 ## [Unreleased]
 
+### Security
+
+- Pin executables and close child environments, including Bash startup.
+- Read and update configuration through validated directory descriptors;
+  serialize CLI changes with a directory lock and reject symlinks/FIFOs.
+- Bound helper reads and process output, enforce deadlines, and terminate
+  and reap spawned descendants on success, cancellation and failure.
+- Poll override metadata instead of reading configuration through FileView.
+- Replace rsync with an explicit payload copied through the filesystem helper.
+- Add executable regression tests for these boundaries and installer lifecycle.
+
 ### Removed
 
 - `bin/omarchy-wallpaper-render` and `docs/RENDER.md`. The render tool was

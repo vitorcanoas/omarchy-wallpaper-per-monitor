@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+#!/usr/bin/bash -p
 # wallpaper-monitor-menu -- visual wallpaper picker, per monitor.
 #
 # Flow: pick MONITOR -> pick IMAGE -> apply via `wallpaper-monitor set`.
@@ -19,31 +19,83 @@
 # Does NOT reimplement writing the override -- calls `wallpaper-monitor set`,
 # which already serializes with a lock, migrates the old format and writes
 # atomically.
+#
+# SHEBANG: absolute, and `/usr/bin/bash` rather than `/bin/bash` -- on Arch
+# /bin is a SYMLINK to usr/bin, which the helper's per-component no-follow
+# walk correctly refuses. Background.qml pins the same spelling.
+
+set -uo pipefail                  # `set -e` is added after the preamble
+
+# --- Closed-environment bootstrap (copied verbatim from the preamble) -----
+# This replaces `SELF="$(readlink -f "${BASH_SOURCE[0]}")"` + `dirname`: two
+# PATH-resolved tools, run before any hardening existed, and without the
+# `CDPATH=''` / `pwd -P` the approved reference uses.
+wpm_bootstrap() {
+  local self=${BASH_SOURCE[1]} dir candidate
+  dir=${self%/*}; [[ $dir == "$self" ]] && dir=.
+  dir=$(CDPATH='' cd -P -- "$dir" 2>/dev/null && pwd -P) || dir=""
+  local -a candidates=(
+    "$dir/wallpaper-monitor-common.sh"        # a bin/ script, run directly
+    "$dir/bin/wallpaper-monitor-common.sh"    # install.sh / uninstall.sh
+    "$HOME/.config/omarchy/plugins/vitorcanoas.background-per-monitor/bin/wallpaper-monitor-common.sh"
+  )                                           # via the ~/.local/bin symlink
+  for candidate in "${candidates[@]}"; do
+    [[ -f $candidate && ! -L $candidate && -r $candidate && -O $candidate ]] || continue
+    WPM_COMMON=$candidate; return 0
+  done
+  printf 'wallpaper-monitor: shared preamble not found or not trustworthy\n' >&2
+  exit 1
+}
+wpm_bootstrap
+# shellcheck source=bin/wallpaper-monitor-common.sh
+. "$WPM_COMMON"
 
 set -euo pipefail
 
-# LC_ALL=C for the same reason as `wp`: pins the order the catalogues are
-# read in, so the list does not change between an interactive terminal and a
-# call coming from the menu keybind.
-export LC_ALL=C
+# The preamble exports LC_ALL=C (and LANG=C), which is what the hand-rolled
+# `export LC_ALL=C` here used to do, for the same reason as in `wp`: it pins
+# the order the catalogues are read in, so the list does not change between an
+# interactive terminal and a call coming from the menu keybind.
 
-SELF="$(readlink -f "${BASH_SOURCE[0]}")"
-SELF_DIR="$(dirname "$SELF")"
+# The neighboring CLI, by absolute path. It used to fall back to the BARE NAME
+# "wallpaper-monitor" when the sibling was not executable -- and that fallback
+# was `exec`'d at the end of main(), i.e. a PATH-resolved process replacement.
+# WPM_CLI is "$WPM_BIN_DIR/wallpaper-monitor", derived by the preamble from
+# its own ${BASH_SOURCE[0]}, so there is nothing left to guess.
+CLI="$WPM_CLI"
 
-# The neighboring CLI, resolved beside this script (it is symlinked into
-# ~/.local/bin, and readlink -f above already resolved the symlink). Falls
-# back to PATH if for some reason it is not alongside.
-CLI="$SELF_DIR/wallpaper-monitor"
-[[ -x $CLI ]] || CLI="wallpaper-monitor"
-
-OVERRIDE_JSON="$HOME/.config/omarchy/background-per-monitor.json"
+# The override file, as the helper addresses it: a trusted absolute root plus
+# a relative path the HELPER splits and validates component by component. The
+# old absolute OVERRIDE_JSON string is gone because its only two uses were the
+# two hand-rolled readers this file no longer has.
+OVERRIDE_REL=".config/omarchy/background-per-monitor.json"
+readonly OVERRIDE_REL
 
 # Same connector-name validation as `wp`: the pipeline below is delimited by
 # newline/TAB, so a name containing one of those would be truncated mid-way
-# and the override would end up on a monitor that does not exist.
-MONITOR_RE='^[A-Za-z0-9._:-]+$'
+# and the override would end up on a monitor that does not exist. The pattern
+# now comes from the preamble (WPM_MONITOR_RE) -- byte for byte what was
+# spelled out here -- so the three CLIs cannot drift apart.
 
 error() { printf 'error: %s\n' "$1" >&2; }
+
+# Reads the override file through the helper's bounded, no-follow,
+# descriptor-relative read and prints its bytes. Every failure -- absent,
+# symlink, FIFO, wrong owner, group-writable, over budget -- prints nothing
+# and returns 1, which is exactly how the three callers' old
+# `2>/dev/null || return 1` behaved.
+#
+# This replaces TWO hand-rolled readers of the same file that lived in this
+# script (root_from_override and current_override): `os.path.getsize()` on the
+# pathname, then a separate plain `open()` of the same pathname, then an
+# unbounded `fh.read()`. That is a TOCTOU between the size check and the open,
+# with no O_NOFOLLOW, no S_ISREG, no owner check, and a cap that was declared
+# but never enforced. bin/wp had a third copy; bin/wallpaper-monitor had the
+# only hardened one. All four are now this one code path.
+read_override() {
+  wpm_cfg read --root "$HOME" --rel "$OVERRIDE_REL" \
+               --max-bytes "$WPM_MAX_CONFIG_BYTES" 2>/dev/null
+}
 
 # ---------------------------------------------------------------------------
 # Art directories.
@@ -66,20 +118,17 @@ error() { printf 'error: %s\n' "$1" >&2; }
 # `wp` only gets it right when run from inside the catalogue checkout.
 # Repeating that resolution here would inherit the same bug.
 root_from_override() {
-  [[ -f $OVERRIDE_JSON ]] || return 1
-  python3 - "$OVERRIDE_JSON" <<'PYEOF' 2>/dev/null || return 1
+  local raw prog
+  raw="$(read_override)" || return 1
+  [[ -n $raw ]] || return 1
+  IFS= read -r -d '' prog <<'PYEOF' || true
 import json
 import os
 import sys
 
-MAX_BYTES = 1 << 20  # same cap as wallpaper-monitor
-
 try:
-    if os.path.getsize(sys.argv[1]) > MAX_BYTES:
-        sys.exit(1)
-    with open(sys.argv[1], "rb") as fh:
-        data = json.loads(fh.read().decode("utf-8"))
-except (OSError, ValueError, UnicodeDecodeError):
+    data = json.loads(sys.stdin.buffer.read().decode("utf-8"))
+except (ValueError, UnicodeDecodeError):
     sys.exit(1)
 
 if not isinstance(data, dict):
@@ -113,6 +162,7 @@ for path in paths:
         sys.exit(0)
 sys.exit(1)
 PYEOF
+  printf '%s' "$raw" | "$PYTHON3" -I -c "$prog" 2>/dev/null || return 1
 }
 
 resolve_catalogue_root() {
@@ -139,7 +189,11 @@ resolve_catalogue_root() {
     return 0
   fi
 
-  cat >&2 <<MSG
+  local text
+  # `read -r -d ''` instead of `cat <<MSG`: identical bytes on stderr, one
+  # fewer ambient-PATH tool. The heredoc is quoted now, so the literal
+  # "$HOME" below no longer needs its backslash.
+  IFS= read -r -d '' text <<'MSG' || true
 error: could not find the wallpaper catalogue.
 
 This menu expects a directory with two orientation subfolders:
@@ -150,10 +204,11 @@ This menu expects a directory with two orientation subfolders:
 Point yours with the WALLPAPER_MONITOR_DIR environment variable, e.g. in your
 ~/.bashrc or ~/.zshrc:
 
-    export WALLPAPER_MONITOR_DIR="\$HOME/Pictures/my-wallpapers/render"
+    export WALLPAPER_MONITOR_DIR="$HOME/Pictures/my-wallpapers/render"
 
 Sort your own images into 16x9/ and 9x16/ subfolders under that directory.
 MSG
+  printf '%s' "$text" >&2
   return 1
 }
 
@@ -168,17 +223,41 @@ MSG
 # Output: one line per active monitor, TAB-separated fields:
 #   <name>\t<w>\t<h>\t<portrait|landscape>
 list_monitors() {
-  command -v hyprctl >/dev/null 2>&1 || {
+  wpm_optional HYPRCTL
+  [[ -n $HYPRCTL ]] || {
     error "hyprctl not found (is Hyprland running?)"
     return 1
   }
 
-  local raw=""
-  raw="$(hyprctl monitors -j 2>/dev/null)" || raw=""
+  # Finding 5: this was `raw="$("$HYPRCTL" monitors -j 2>/dev/null)"` -- a
+  # consumer-side command substitution with no cap, no deadline and no
+  # supervision. A hyprctl that floods stdout was buffered into this shell
+  # until the OOM killer or the user intervened (measured at 5.2 GB resident,
+  # the menu never opening); one that never closed stdout hung the menu
+  # forever. wpm_bounded gives it its own session, a cap enforced as bytes
+  # ARRIVE, a 5 s deadline and a killpg TERM -> grace -> KILL -> waitpid
+  # teardown of the whole group.
+  #
+  # FALLBACK BEHAVIOUR IS UNCHANGED: the old code degraded QUIETLY on any
+  # hyprctl failure -- `|| raw=""` -- and so does this. An empty $raw makes the
+  # filter below exit 1, list_monitors returns 1, and the caller prints its own
+  # "could not read the monitors (hyprctl monitors -j failed)" and exits 1,
+  # exactly as before. The ONE addition is a loud line when the cap or the
+  # deadline is what failed: refusing to parse a truncated monitor list matters
+  # here because a partial parse would silently offer the user a SUBSET of
+  # their monitors as if it were all of them.
+  local raw="" hrc=0
+  raw="$(wpm_bounded "$WPM_MAX_HYPRCTL_BYTES" 5 -- "$HYPRCTL" monitors -j)" || hrc=$?
+  if (( hrc == 6 || hrc == 7 )); then
+    error "hyprctl monitors -j exceeded ${WPM_MAX_HYPRCTL_BYTES} bytes or 5s -- refusing to parse a partial answer"
+    raw=""
+  elif (( hrc != 0 )); then
+    raw=""
+  fi
 
   # JSON via argv, not stdin: with a heredoc, python's stdin would be the
   # script itself. Same care already taken in wallpaper-monitor cmd_list.
-  python3 - "$raw" <<'PYEOF'
+  "$PYTHON3" -I - "$raw" <<'PYEOF'
 import json
 import sys
 
@@ -228,26 +307,23 @@ PYEOF
 # Reads a monitor's current override, to pass as --selected. Empty when there
 # is none -- the picker simply preselects nothing.
 current_override() {  # $1 = monitor name
-  [[ -f $OVERRIDE_JSON ]] || return 0
-  python3 - "$OVERRIDE_JSON" "$1" <<'PYEOF' 2>/dev/null || return 0
+  local raw prog
+  raw="$(read_override)" || return 0
+  [[ -n $raw ]] || return 0
+  IFS= read -r -d '' prog <<'PYEOF' || true
 import json
 import os
 import sys
 
-MAX_BYTES = 1 << 20
-
 try:
-    if os.path.getsize(sys.argv[1]) > MAX_BYTES:
-        sys.exit(0)
-    with open(sys.argv[1], "rb") as fh:
-        data = json.loads(fh.read().decode("utf-8"))
-except (OSError, ValueError, UnicodeDecodeError):
+    data = json.loads(sys.stdin.buffer.read().decode("utf-8"))
+except (ValueError, UnicodeDecodeError):
     sys.exit(0)
 
 if not isinstance(data, dict):
     sys.exit(0)
 
-monitor = sys.argv[2]
+monitor = sys.argv[1]
 monitors = data.get("monitors")
 if isinstance(monitors, dict):
     value = monitors.get(monitor)
@@ -258,12 +334,14 @@ else:
 if isinstance(value, str) and value:
     print(value)
 PYEOF
+  printf '%s' "$raw" | "$PYTHON3" -I -c "$prog" "$1" 2>/dev/null || return 0
 }
 
 # ---------------------------------------------------------------------------
 main() {
   if (( $# > 0 )); then
-    cat >&2 <<'MSG'
+    local text
+    IFS= read -r -d '' text <<'MSG' || true
 usage: wallpaper-monitor-menu
 
 No arguments. Opens the monitor picker and then the image picker for the
@@ -272,15 +350,26 @@ matching orientation, and applies the choice.
 Environment variables:
   WALLPAPER_MONITOR_DIR   catalogue directory (containing 16x9/ and 9x16/)
 MSG
+    printf '%s' "$text" >&2
     exit 1
   fi
 
-  for dep in omarchy-menu-select omarchy-menu-images python3; do
-    command -v "$dep" >/dev/null 2>&1 || {
-      error "$dep not found (is Omarchy installed?)"
-      exit 1
-    }
-  done
+  # The dependency probe used to be `command -v` over bare names, which only
+  # answers a question about the PATH at probe time -- the invocation fifty
+  # lines later re-answers it. wpm_optional resolves each ONE absolute
+  # candidate list, validates it through the helper's check-tool, and freezes
+  # it; the messages below are unchanged. python3 needs no probe at all: the
+  # preamble resolves and validates it before this script's first statement,
+  # and aborts with its own one-line error if it cannot.
+  wpm_optional OMARCHY_MENU_SELECT OMARCHY_MENU_IMAGES
+  [[ -n $OMARCHY_MENU_SELECT ]] || {
+    error "omarchy-menu-select not found (is Omarchy installed?)"
+    exit 1
+  }
+  [[ -n $OMARCHY_MENU_IMAGES ]] || {
+    error "omarchy-menu-images not found (is Omarchy installed?)"
+    exit 1
+  }
 
   local root
   root="$(resolve_catalogue_root)" || exit 1
@@ -305,7 +394,7 @@ MSG
   local name w h orient glyph label
   while IFS=$'\t' read -r name w h orient; do
     [[ -n $name ]] || continue
-    if [[ ! $name =~ $MONITOR_RE ]]; then
+    if [[ ! $name =~ $WPM_MONITOR_RE ]]; then
       error "hyprctl reported an unexpected monitor name: '$name' (ignored)"
       continue
     fi
@@ -335,7 +424,7 @@ MSG
   else
     local choice=""
     # Canceling exits != 0 in omarchy-menu-select; not an error of ours.
-    choice="$(omarchy-menu-select "Monitor wallpaper" "${options[@]}")" || exit 0
+    choice="$(wpm_bounded 4096 120 -- "$OMARCHY_MENU_SELECT" "Monitor wallpaper" "${options[@]}")" || exit 0
     [[ -n $choice ]] || exit 0
 
     # The answer is "<label>\t<subtext>"; the subtext is the connector name.
@@ -378,7 +467,7 @@ MSG
   local image=""
   # Canceling prints empty (and may exit != 0); in both cases, exit 0 without
   # applying anything.
-  image="$(omarchy-menu-images "${args[@]}" "$dir")" || exit 0
+  image="$(wpm_bounded 4096 120 -- "$OMARCHY_MENU_IMAGES" "${args[@]}" "$dir")" || exit 0
   [[ -n $image ]] || exit 0
 
   if [[ ! -f $image ]]; then

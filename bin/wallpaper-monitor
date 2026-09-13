@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+#!/usr/bin/bash -p
 # wallpaper-monitor -- manages per-monitor (and per-orientation) wallpaper
 # overrides for the vitorcanoas.background plugin
 # (~/.config/omarchy/plugins/vitorcanoas.background).
@@ -17,25 +17,74 @@
 # Precedence in the plugin: monitors[name] > portrait/landscape (based on
 # height > width post-rotation) > Omarchy's native symlink.
 #
-# The QML plugin watches this file live (FileView watchChanges: true) -- no
-# need to restart the shell after set/clear.
+# The QML plugin picks this file up live -- no need to restart the shell after
+# set/clear. It does NOT open the file itself: a 2000 ms repeating Timer in
+# Background.qml runs the helper's bounded, no-follow `stat` and compares the
+# identity it returns (type, mode, uid, gid, size, dev, ino, nlink, mtime_ns)
+# against the previous answer; any difference triggers the helper's bounded
+# `read`. So a set/clear shows up within about two seconds rather than
+# instantly.
 #
 # Per-orientation fallback idea ported from upstream PR #10249 (DCPRevere,
 # omacom/omarchy, https://github.com/omacom/omarchy/pull/10249).
+#
+# SHEBANG: absolute, and `/usr/bin/bash` rather than `/bin/bash` -- on Arch
+# (Omarchy's base) /bin is a SYMLINK to usr/bin, which the helper's
+# per-component no-follow walk correctly refuses, so /usr/bin is the only
+# spelling the whole plugin can agree on. Background.qml already pins it.
+
+set -uo pipefail                  # `set -e` is added after the preamble; see (2)
+
+# --- Closed-environment bootstrap (copied verbatim from the preamble) -----
+# Pure bash: finding the tools is the thing this bootstraps, so it cannot call
+# one. `readlink -f`, which bin/wp and bin/wallpaper-monitor-menu used here,
+# was itself PATH-resolved and ran before any hardening existed.
+wpm_bootstrap() {
+  local self=${BASH_SOURCE[1]} dir candidate
+  dir=${self%/*}; [[ $dir == "$self" ]] && dir=.
+  dir=$(CDPATH='' cd -P -- "$dir" 2>/dev/null && pwd -P) || dir=""
+  local -a candidates=(
+    "$dir/wallpaper-monitor-common.sh"        # a bin/ script, run directly
+    "$dir/bin/wallpaper-monitor-common.sh"    # install.sh / uninstall.sh
+    "$HOME/.config/omarchy/plugins/vitorcanoas.background-per-monitor/bin/wallpaper-monitor-common.sh"
+  )                                           # via the ~/.local/bin symlink
+  for candidate in "${candidates[@]}"; do
+    [[ -f $candidate && ! -L $candidate && -r $candidate && -O $candidate ]] || continue
+    WPM_COMMON=$candidate; return 0
+  done
+  printf 'wallpaper-monitor: shared preamble not found or not trustworthy\n' >&2
+  exit 1
+}
+wpm_bootstrap
+# shellcheck source=bin/wallpaper-monitor-common.sh
+. "$WPM_COMMON"
 
 set -euo pipefail
 
 OVERRIDE_JSON="${HOME}/.config/omarchy/background-per-monitor.json"
 
+# The same target, as the helper addresses it: a trusted absolute root plus a
+# relative path the HELPER splits and validates component by component. The
+# string above stays because it is what the user sees in messages and in the
+# backup name; every filesystem operation now goes through the pair below.
+OVERRIDE_REL=".config/omarchy/background-per-monitor.json"
+OVERRIDE_DIR_REL=".config/omarchy"
+readonly OVERRIDE_REL OVERRIDE_DIR_REL
+
 # Exit codes:
 #   1 = usage error / invalid argument
 #   2 = JSON exists but is unreadable (NOTHING was changed)
 #   3 = could not serialize the write (lock)
+# UNCHANGED by the hardening: the helper's own 0-7 codes are translated back
+# onto these two by wpm_map_exit(), so nothing user-visible moved.
 EXIT_UNREADABLE=2
 EXIT_LOCK=3
 
 usage() {
-  cat >&2 <<EOF
+  local text
+  # `read -r -d ''` instead of `cat <<EOF`: same bytes on stderr, one fewer
+  # ambient-PATH tool. (F1 names `cat` in its "etc.".)
+  IFS= read -r -d '' text <<'EOF' || true
 Usage:
   wallpaper-monitor set <MONITOR> <image-path>       write an override for the monitor
   wallpaper-monitor set-portrait <image-path>        write the portrait default
@@ -54,173 +103,70 @@ Examples:
 The old format (flat, without the "monitors" key) is migrated automatically to
 the new format on this CLI's first write; a .bak backup is made first.
 EOF
+  printf '%s' "$text" >&2
   exit 1
 }
 
 # ---------------------------------------------------------------------------
-# Write serialization.
-#
-# The final replacement (mv) was already atomic, but the read-modify-write
-# cycle was not serialized: `wp h 3 & wp v 5 &` made both read the same old
-# JSON and the loser vanished from the file. The lock below covers
-# migrate+read+write end to end.
-#
-# DIRECTORY lock (mkdir), not `flock 9>file`: mkdir does not follow a symlink
-# in the final component, so the lock path is never opened through a link
-# planted by another process. Same technique already approved in PR #8 of
-# vitorcanoas/omarchy-nightlight (commit 78d9fb4), required by the Omarchy
-# marketplace maintainer.
-RUNTIME_DIR=""
-LOCK=""
-
-runtime_dir_is_private() {
-  local dir=${1-} mode
-  [[ -n $dir && -d $dir && ! -L $dir && -O $dir ]] || return 1
-  mode=$(stat -c '%a' -- "$dir" 2>/dev/null) || return 1
-  [[ $mode == 700 ]]
-}
-
-# XDG_RUNTIME_DIR is a private directory by definition. When it is missing,
-# fall back to a per-user directory in /tmp, created with mode 0700 and
-# refused if another user already controls the name. Never fall back to a
-# global lock.
-prepare_runtime_dir() {
-  local candidate tmp_mode
-  if [[ -n ${XDG_RUNTIME_DIR:-} ]] && runtime_dir_is_private "${XDG_RUNTIME_DIR:-}"; then
-    RUNTIME_DIR=$XDG_RUNTIME_DIR
-  else
-    candidate="/tmp/omarchy-wallpaper-monitor-${EUID}"
-    [[ -d /tmp && ! -L /tmp && -w /tmp && -k /tmp ]] || return 1
-    tmp_mode=$(stat -c '%a' -- /tmp 2>/dev/null) || return 1
-    (( 8#$tmp_mode & 01000 )) || return 1
-    [[ ! -L $candidate ]] || return 1
-    if [[ ! -e $candidate ]]; then
-      ( umask 077; mkdir -- "$candidate" ) 2>/dev/null || return 1
-    fi
-    runtime_dir_is_private "$candidate" || return 1
-    RUNTIME_DIR=$candidate
-  fi
-  LOCK="$RUNTIME_DIR/omarchy-wallpaper-monitor.lock.d"
-}
-
-acquire_lock() {
-  local path=$1 deadline=$((SECONDS + 5)) owner created now
-  while :; do
-    [[ ! -L $path && ( ! -e $path || -d $path ) ]] || return 1
-    if ( umask 077; mkdir -- "$path" ) 2>/dev/null; then
-      if printf '%s\n' "$$" >"$path/pid" 2>/dev/null; then
-        return 0
-      fi
-      rm -f -- "$path/pid" 2>/dev/null || true
-      rmdir -- "$path" 2>/dev/null || true
-      return 1
-    fi
-
-    [[ ! -L $path && -d $path ]] || return 1
-    owner=$(cat -- "$path/pid" 2>/dev/null || true)
-    if [[ $owner =~ ^[0-9]+$ ]] && ! kill -0 "$owner" 2>/dev/null; then
-      rm -f -- "$path/pid" 2>/dev/null || true
-      rmdir -- "$path" 2>/dev/null || true
-      continue
-    fi
-    if [[ ! $owner =~ ^[0-9]+$ ]]; then
-      # A SIGKILL between the mkdir and writing the pid leaves a valid lock
-      # with no owner. Do not remove a lock that may have just been born;
-      # past the normal acquisition timeout it is safe to recover this
-      # incomplete lock.
-      created=$(stat -c '%Y' -- "$path" 2>/dev/null || echo 0)
-      now=$(date +%s 2>/dev/null || echo 0)
-      if [[ $created =~ ^[0-9]+$ && $now =~ ^[0-9]+$ ]] && (( now - created >= 5 )); then
-        rmdir -- "$path" 2>/dev/null || true
-        continue
-      fi
-    fi
-    (( SECONDS >= deadline )) && return 1
-    LC_ALL=C sleep 0.05 || return 1
-  done
-}
-
-release_lock() {
-  local path=${1-}
-  [[ -n $path && ! -L $path && -d $path ]] || return 0
-  rm -f -- "$path/pid" 2>/dev/null || true
-  rmdir -- "$path" 2>/dev/null || true
-}
-
-# Runs "$@" while holding the write lock. Exits with a clear error if it
-# cannot serialize -- better to refuse than to write over someone else.
+# Hold the validated config directory open for the entire read/migrate/write
+# operation. flock is released by the kernel on exit; no stale pid file or
+# pathname-based lock cleanup is needed.
 with_lock() {
-  if ! prepare_runtime_dir; then
-    echo "error: could not prepare a private runtime directory for the lock; nothing was changed" >&2
-    exit "$EXIT_LOCK"
-  fi
-  if ! acquire_lock "$LOCK"; then
-    echo "error: another wallpaper-monitor is writing (lock: $LOCK); nothing was changed" >&2
-    exit "$EXIT_LOCK"
-  fi
-  trap 'release_lock "$LOCK"' EXIT
-  "$@"
+  wpm_cfg lock-run --root "$HOME" --rel "$OVERRIDE_DIR_REL" -- \
+    /usr/bin/bash -p "$WPM_CLI" --locked "$@"
 }
 
-ensure_json_exists() {
-  if [[ ! -f "$OVERRIDE_JSON" ]]; then
-    mkdir -p "$(dirname "$OVERRIDE_JSON")"
-    ( umask 022; printf '{\n  "monitors": {}\n}\n' > "$OVERRIDE_JSON" )
-  fi
-}
-
-# Shared Python snippet: reads the target JSON with the validations the
-# marketplace maintainer requires (no-follow, regular file, owner, size cap)
-# and distinguishes "does not exist" (ok, starts empty) from "exists but is
-# unreadable" (ERROR -- nothing may be changed).
+# ---------------------------------------------------------------------------
+# The JSON transaction.
 #
-# Never interpolate external data in here: everything comes in through argv.
-read_json_py() {
-  cat <<'PYEOF'
+# WHAT CHANGED AND WHY (marketplace finding 5).
+#
+# What used to be here was this file's own best code and then threw its own
+# guarantees away. `load_target` opened the config O_NOFOLLOW, fstat'ed the
+# DESCRIPTOR for S_ISREG, for ownership and for size -- and then closed it.
+# `write_atomic` re-entered through the PATHNAME: `os.stat(path)` for the
+# mode, `tempfile.mkstemp(..., suffix=".tmp")` for the staging file, and
+# `os.replace(tmp_path, path)` to publish, with the directory opened by name
+# AFTER the rename to fsync it. Every one of those re-resolutions is a fresh
+# race against the checks two functions earlier, and the fixed `.tmp` suffix
+# is the same predictable-temp-name family the moderator blocked on the
+# sibling plugin.
+#
+# All of it is now ONE helper `edit` transaction, which holds ONE validated
+# directory descriptor from the first open to the fsync after the rename,
+# stages through an unpredictable 128-bit name, and re-stats the target on
+# that same descriptor -- dev, ino, uid, type, mode, size, mtime_ns, ctime_ns
+# -- immediately before publishing. A mismatch publishes NOTHING.
+#
+# The JSON mutations themselves are UNCHANGED, byte for byte. They are pure
+# stdin->stdout filters now, and the helper runs them supervised: the old
+# content on their stdin, their stdout becomes the new content, a non-zero
+# exit or a cap breach or the deadline aborts before anything is written.
+#
+# Never interpolate external data into these programs: everything crosses via
+# argv, exactly as before.
+IFS= read -r -d '' FILTER_PRELUDE <<'PYEOF' || true
 import json
-import os
-import stat
 import sys
-
-MAX_BYTES = 1 << 20  # 1 MiB: an override map comes nowhere near this
 
 
 def load_target(path):
-    """Returns (data, existed). Raises SystemExit(2) if it exists and is unreadable."""
-    try:
-        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
-    except FileNotFoundError:
-        return {}, False
-    except OSError as e:
-        print(
-            f"error: {path} exists but is unreadable ({e}) -- nothing was changed",
-            file=sys.stderr,
-        )
-        raise SystemExit(2)
+    """Returns (data, existed) from the content on stdin.
 
-    try:
-        st = os.fstat(fd)
-        if not stat.S_ISREG(st.st_mode):
-            print(
-                f"error: {path} exists but is not a regular file -- nothing was changed",
-                file=sys.stderr,
-            )
-            raise SystemExit(2)
-        if st.st_uid != os.geteuid():
-            print(
-                f"error: {path} belongs to another user (uid {st.st_uid}) -- nothing was changed",
-                file=sys.stderr,
-            )
-            raise SystemExit(2)
-        if st.st_size > MAX_BYTES:
-            print(
-                f"error: {path} is {st.st_size} bytes (limit {MAX_BYTES}) -- nothing was changed",
-                file=sys.stderr,
-            )
-            raise SystemExit(2)
-        raw = os.read(fd, MAX_BYTES)
-    finally:
-        os.close(fd)
+    The helper has already done every check this function used to do for
+    itself, and done them on a descriptor it still holds: O_NOFOLLOW so a
+    symlink is refused, O_NONBLOCK so a FIFO fails instead of hanging the
+    caller forever, S_ISREG, owner == euid, no group/other write bit, and an
+    INCREMENTAL bounded read that fails at the cap instead of silently
+    truncating to it. `path` is kept only so the messages below still name the
+    file the user has to fix.
+
+    `existed` is always True here: by the time a filter runs, absence has
+    already been decided by the caller (ensure_json_exists, cmd_list) using
+    the helper's `stat`, which distinguishes "missing" from "empty" without
+    opening anything.
+    """
+    raw = sys.stdin.buffer.read()
 
     if not raw.strip():
         # Empty file: treated as "not configured yet", not as corruption.
@@ -254,45 +200,16 @@ def load_target(path):
 
 
 def write_atomic(path, data, mode=None):
-    """Writes data to path via a temp file in the SAME directory + fsync + rename."""
-    import tempfile
+    """Emits the new content on stdout. The helper publishes it.
 
-    directory = os.path.dirname(path) or "."
-    if mode is None:
-        try:
-            mode = stat.S_IMODE(os.stat(path).st_mode)
-        except OSError:
-            mode = 0o644
-
-    fd, tmp_path = tempfile.mkstemp(dir=directory, prefix=".background-per-monitor.", suffix=".tmp")
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2, ensure_ascii=False)
-            f.write("\n")
-            f.flush()
-            os.fsync(f.fileno())
-        # mkstemp creates 0600; preserve the original's mode (or 644) so the
-        # file does not become unreadable for the rest of the user's session.
-        os.chmod(tmp_path, mode)
-        os.replace(tmp_path, path)
-        tmp_path = None
-    finally:
-        if tmp_path is not None:
-            try:
-                os.unlink(tmp_path)
-            except OSError:
-                pass
-
-    # Durability of the rename: without this, a power cut right after can
-    # leave the directory without the new entry.
-    try:
-        dfd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
-        try:
-            os.fsync(dfd)
-        finally:
-            os.close(dfd)
-    except OSError:
-        pass
+    The temp file, the fsync, the mode preservation, the revalidation and the
+    rename all moved into the helper, where they happen through the single
+    directory descriptor that validated the target in the first place. This
+    function keeps its name and signature so the seven mutation programs
+    below did not have to be touched at all.
+    """
+    json.dump(data, sys.stdout, indent=2, ensure_ascii=False)
+    sys.stdout.write("\n")
 
 
 def normalize(data):
@@ -300,6 +217,82 @@ def normalize(data):
         data["monitors"] = {}
     return data
 PYEOF
+readonly FILTER_PRELUDE
+
+# Both readers below set a GLOBAL rather than printing their answer, and that
+# is deliberate: wpm_map_exit() ends the process, and inside a `$( ... )` it
+# would only end the SUBSHELL -- the caller would carry on with an empty
+# string and a lost exit code. (That is not hypothetical: the first cut of
+# this file did exactly that, and `list` on a machine with no ~/.config
+# printed the empty-config listing AND exited 2.)
+#
+# They also fold stderr into the captured text and replay it only on failure.
+# The helper's contract is "stdout is payload only, all diagnostics on
+# stderr, one line" and a successful run with no --trace emits nothing on
+# stderr, so on rc == 0 what comes back is exactly the file's bytes.
+OVERRIDE_RAW=""
+OVERRIDE_KIND="absent"
+
+# Reads the override file through the helper's bounded, no-follow,
+# descriptor-relative read into OVERRIDE_RAW. Exits with this CLI's own
+# EXIT_UNREADABLE on any boundary violation, so callers keep today's codes.
+read_override() {
+  local out rc=0
+  OVERRIDE_RAW=""
+  out=$(wpm_cfg read --root "$HOME" --rel "$OVERRIDE_REL" \
+                     --max-bytes "$WPM_MAX_CONFIG_BYTES" --allow-missing 2>&1) || rc=$?
+  # 4 = a component of ~/.config/omarchy does not exist yet. --allow-missing
+  # covers the FILE; the directory chain above it is the caller's business,
+  # and "not configured yet" is the honest reading of it -- the same answer
+  # the old `[[ -f ... ]]` probe gave.
+  (( rc == 4 )) && return 0
+  if (( rc != 0 )); then
+    printf '%s\n' "$out" >&2
+    wpm_map_exit "$rc"
+  fi
+  OVERRIDE_RAW=$out
+}
+
+# `type=...` of the override file into OVERRIDE_KIND, without opening it and
+# without following a symlink in any component. `absent` when it is not there.
+override_kind() {
+  local out rc=0 key value
+  OVERRIDE_KIND="absent"
+  out=$(wpm_cfg stat --root "$HOME" --rel "$OVERRIDE_REL" --allow-missing 2>&1) || rc=$?
+  (( rc == 4 )) && return 0
+  if (( rc != 0 )); then
+    printf '%s\n' "$out" >&2
+    wpm_map_exit "$rc"
+  fi
+  # `if`, not `[[ ... ]] && ...`: the last line the helper prints is mtime_ns,
+  # so a bare && list would leave the whole `while` -- and therefore this
+  # function -- with status 1, which `set -e` turns into a silent exit 1.
+  while IFS='=' read -r key value; do
+    if [[ $key == type ]]; then OVERRIDE_KIND=$value; fi
+  done <<<"$out"
+}
+
+ensure_json_exists() {
+  local rc=0 prog
+  wpm_cfg mkdir-chain --root "$HOME" --rel "$OVERRIDE_DIR_REL" --mode 0755 || rc=$?
+  (( rc == 0 )) || wpm_map_exit "$rc"
+
+  override_kind
+  [[ $OVERRIDE_KIND == absent ]] || return 0
+
+  IFS= read -r -d '' prog <<'PYEOF' || true
+
+json_path = sys.argv[1]
+write_atomic(json_path, {"monitors": {}})
+PYEOF
+  # --mode 0644 is exactly what the old `( umask 022; printf ... > file )`
+  # produced, and it applies ONLY to a file being created: an existing target
+  # keeps its own mode, read off its own validated descriptor.
+  rc=0
+  wpm_cfg edit --root "$HOME" --rel "$OVERRIDE_REL" \
+               --max-bytes "$WPM_MAX_CONFIG_BYTES" --mode 0644 \
+               -- "$PYTHON3" -I -c "$FILTER_PRELUDE$prog" "$OVERRIDE_JSON" || rc=$?
+  (( rc == 0 )) || wpm_map_exit "$rc"
 }
 
 # Migrates the JSON from the old format (flat, without "monitors") to the new
@@ -310,9 +303,8 @@ PYEOF
 migrate_if_needed() {
   ensure_json_exists
 
-  local needs_migration
-  needs_migration="$(python3 - "$OVERRIDE_JSON" <<PYEOF
-$(read_json_py)
+  local needs_migration prog rc=0
+  IFS= read -r -d '' prog <<'PYEOF' || true
 
 json_path = sys.argv[1]
 data, _existed = load_target(json_path)
@@ -322,19 +314,42 @@ if "monitors" in data and isinstance(data["monitors"], dict):
 else:
     print("yes")
 PYEOF
-)" || exit "$EXIT_UNREADABLE"
+  # This probe is also what keeps a MALFORMED config exiting EXIT_UNREADABLE
+  # rather than the helper's transaction code: it parses the file before the
+  # first `edit` of the command runs, under the lock, and fails here with 2.
+  read_override
+  needs_migration="$(printf '%s' "$OVERRIDE_RAW" \
+    | "$PYTHON3" -I -c "$FILTER_PRELUDE$prog" "$OVERRIDE_JSON")" \
+    || exit "$EXIT_UNREADABLE"
 
   if [[ "$needs_migration" != "yes" ]]; then
     return 0
   fi
 
-  local bak
-  bak="${OVERRIDE_JSON}.bak.$(date +%Y%m%d-%H%M%S)"
-  cp -p -- "$OVERRIDE_JSON" "$bak"
+  # The backup NAME is unchanged -- users look for it, and it is written by
+  # the helper into the same validated directory, not by a `cp -p` that
+  # follows symlinks. Its mode is the source's own, read off the descriptor.
+  local stamp bak bak_rel mode="" key value
+  printf -v stamp '%(%Y%m%d-%H%M%S)T' -1      # builtin, replaces `date +...`
+  bak="${OVERRIDE_JSON}.bak.${stamp}"
+  bak_rel="${OVERRIDE_REL}.bak.${stamp}"
+
+  local statout
+  statout=$(wpm_cfg stat --root "$HOME" --rel "$OVERRIDE_REL") || rc=$?
+  (( rc == 0 )) || wpm_map_exit "$rc"
+  while IFS='=' read -r key value; do
+    if [[ $key == mode ]]; then mode=$value; fi
+  done <<<"$statout"
+  [[ -n $mode ]] || mode=0644
+
+  rc=0
+  wpm_cfg install-file --src-root "$HOME" --src-rel "$OVERRIDE_REL" \
+                       --dst-root "$HOME" --dst-rel "$bak_rel" \
+                       --mode "$mode" --max-bytes "$WPM_MAX_CONFIG_BYTES" || rc=$?
+  (( rc == 0 )) || wpm_map_exit "$rc"
   echo "warning: old-format JSON detected -- migrating to the new format (backup: $bak)" >&2
 
-  python3 - "$OVERRIDE_JSON" <<PYEOF || exit "$EXIT_UNREADABLE"
-$(read_json_py)
+  IFS= read -r -d '' prog <<'PYEOF' || true
 
 json_path = sys.argv[1]
 data, _existed = load_target(json_path)
@@ -344,6 +359,11 @@ data, _existed = load_target(json_path)
 # exist as a dict here.
 write_atomic(json_path, {"monitors": data})
 PYEOF
+  rc=0
+  wpm_cfg edit --root "$HOME" --rel "$OVERRIDE_REL" \
+               --max-bytes "$WPM_MAX_CONFIG_BYTES" --mode 0644 \
+               -- "$PYTHON3" -I -c "$FILTER_PRELUDE$prog" "$OVERRIDE_JSON" || rc=$?
+  (( rc == 0 )) || wpm_map_exit "$rc"
 }
 
 # Resolves an image path to absolute, checks that it exists and that it really
@@ -355,9 +375,20 @@ PYEOF
 # interpolated into code -- it is defense against SILENT failure: writing an
 # override for a name no monitor can have simply makes the wallpaper not
 # appear, with no error.
+#
+# The shape comes from the preamble now (WPM_MONITOR_RE), so this file, bin/wp
+# and bin/wallpaper-monitor-menu cannot drift apart. It is byte-for-byte the
+# pattern this function already used.
+#
+# There is deliberately NO length cap here. WPM_MAX_MONITOR_NAME_BYTES exists
+# to bound what HYPRCTL reports -- an untrusted producer, which is the defect
+# class finding 5 names -- and it is applied where that output is parsed, in
+# cmd_list. The argument to `wallpaper-monitor set` is the user's own, no
+# finding asks for it to be capped, and capping it would change what the CLI
+# accepts for no security reason.
 validate_monitor_name() {
   local monitor="$1"
-  if [[ ! "$monitor" =~ ^[A-Za-z0-9._:-]+$ ]]; then
+  if [[ ! "$monitor" =~ $WPM_MONITOR_RE ]]; then
     echo "error: invalid monitor name: $monitor" >&2
     echo "       use the connector name, as shown by 'wallpaper-monitor list'" >&2
     echo "       (letters, digits and . _ : -)" >&2
@@ -368,15 +399,29 @@ validate_monitor_name() {
 resolve_image() {
   local image="$1"
   local abs_image
-  abs_image="$(realpath -m -- "$image")"
+  wpm_require REALPATH
+  wpm_optional FILE
+  abs_image="$("$REALPATH" -m -- "$image")"
   if [[ ! -f "$abs_image" ]]; then
     echo "error: image file does not exist: $abs_image" >&2
     exit 1
   fi
 
-  local mime=""
-  if command -v file >/dev/null 2>&1; then
-    mime="$(file -b --mime-type -- "$abs_image" 2>/dev/null || true)"
+  local mime="" rc=0
+  if [[ -n $FILE ]]; then
+    # F5: this used to be a bare, unbounded, undeadlined consumer-side command
+    # substitution on a path the user chose. wpm_bounded runs it through the
+    # helper's supervised `run`: own session, producer-side byte cap checked as
+    # bytes arrive, 5 s deadline, and killpg TERM -> grace -> KILL -> waitpid
+    # on the whole group. Going over the cap is a LOUD failure below, never a
+    # silently truncated mime type.
+    mime="$(wpm_bounded "$WPM_MAX_FILE_BYTES" 5 -- "$FILE" -b --mime-type -- "$abs_image")" || rc=$?
+    if (( rc == 6 || rc == 7 )); then
+      echo "error: 'file' exceeded ${WPM_MAX_FILE_BYTES} bytes or 5s for: $abs_image" >&2
+      echo "       refusing to act on a partial answer; nothing was changed" >&2
+      exit 1
+    fi
+    (( rc == 0 )) || mime=""
   fi
 
   if [[ -n "$mime" ]]; then
@@ -426,12 +471,11 @@ cmd_set() {
 }
 
 cmd_set_locked() {
-  local monitor="$1" abs_image="$2"
+  local monitor="$1" abs_image="$2" prog rc=0
 
   migrate_if_needed
 
-  python3 - "$OVERRIDE_JSON" "$monitor" "$abs_image" <<PYEOF || exit "$EXIT_UNREADABLE"
-$(read_json_py)
+  IFS= read -r -d '' prog <<'PYEOF' || true
 
 json_path, monitor, image = sys.argv[1:4]
 
@@ -440,6 +484,11 @@ data = normalize(data)
 data["monitors"][monitor] = image
 write_atomic(json_path, data)
 PYEOF
+  wpm_cfg edit --root "$HOME" --rel "$OVERRIDE_REL" \
+               --max-bytes "$WPM_MAX_CONFIG_BYTES" --mode 0644 \
+               -- "$PYTHON3" -I -c "$FILTER_PRELUDE$prog" \
+                  "$OVERRIDE_JSON" "$monitor" "$abs_image" || rc=$?
+  (( rc == 0 )) || wpm_map_exit "$rc"
 }
 
 cmd_set_orientation() {
@@ -466,12 +515,11 @@ cmd_set_orientation() {
 }
 
 cmd_set_orientation_locked() {
-  local key="$1" abs_image="$2"
+  local key="$1" abs_image="$2" prog rc=0
 
   migrate_if_needed
 
-  python3 - "$OVERRIDE_JSON" "$key" "$abs_image" <<PYEOF || exit "$EXIT_UNREADABLE"
-$(read_json_py)
+  IFS= read -r -d '' prog <<'PYEOF' || true
 
 json_path, key, image = sys.argv[1:4]
 
@@ -480,6 +528,11 @@ data = normalize(data)
 data[key] = image
 write_atomic(json_path, data)
 PYEOF
+  wpm_cfg edit --root "$HOME" --rel "$OVERRIDE_REL" \
+               --max-bytes "$WPM_MAX_CONFIG_BYTES" --mode 0644 \
+               -- "$PYTHON3" -I -c "$FILTER_PRELUDE$prog" \
+                  "$OVERRIDE_JSON" "$key" "$abs_image" || rc=$?
+  (( rc == 0 )) || wpm_map_exit "$rc"
 }
 
 cmd_clear() {
@@ -502,12 +555,11 @@ cmd_clear() {
 }
 
 cmd_clear_locked() {
-  local monitor="$1"
+  local monitor="$1" prog rc=0
 
   migrate_if_needed
 
-  python3 - "$OVERRIDE_JSON" "$monitor" <<PYEOF || exit "$EXIT_UNREADABLE"
-$(read_json_py)
+  IFS= read -r -d '' prog <<'PYEOF' || true
 
 json_path, monitor = sys.argv[1:3]
 
@@ -516,6 +568,11 @@ data = normalize(data)
 data["monitors"].pop(monitor, None)
 write_atomic(json_path, data)
 PYEOF
+  wpm_cfg edit --root "$HOME" --rel "$OVERRIDE_REL" \
+               --max-bytes "$WPM_MAX_CONFIG_BYTES" --mode 0644 \
+               -- "$PYTHON3" -I -c "$FILTER_PRELUDE$prog" \
+                  "$OVERRIDE_JSON" "$monitor" || rc=$?
+  (( rc == 0 )) || wpm_map_exit "$rc"
 }
 
 cmd_clear_orientation() {
@@ -533,12 +590,11 @@ cmd_clear_orientation() {
 }
 
 cmd_clear_orientation_locked() {
-  local key="$1"
+  local key="$1" prog rc=0
 
   migrate_if_needed
 
-  python3 - "$OVERRIDE_JSON" "$key" <<PYEOF || exit "$EXIT_UNREADABLE"
-$(read_json_py)
+  IFS= read -r -d '' prog <<'PYEOF' || true
 
 json_path, key = sys.argv[1:3]
 
@@ -546,11 +602,18 @@ data, _existed = load_target(json_path)
 data.pop(key, None)
 write_atomic(json_path, data)
 PYEOF
+  wpm_cfg edit --root "$HOME" --rel "$OVERRIDE_REL" \
+               --max-bytes "$WPM_MAX_CONFIG_BYTES" --mode 0644 \
+               -- "$PYTHON3" -I -c "$FILTER_PRELUDE$prog" \
+                  "$OVERRIDE_JSON" "$key" || rc=$?
+  (( rc == 0 )) || wpm_map_exit "$rc"
 }
 
 # list is READ-ONLY: never migrates, never writes. A diagnostic command that
 # rewrites the very file you are trying to diagnose is the worst kind of bug
 # -- before this fix, a `list` on a corrupted JSON erased all overrides.
+# Still true after the hardening: the only helper subcommands it uses are
+# `stat`, `read` and `run`, none of which can write anything.
 cmd_list() {
   if [[ $# -ne 0 ]]; then
     echo "error: usage: wallpaper-monitor list (no arguments)" >&2
@@ -558,16 +621,18 @@ cmd_list() {
   fi
 
   echo "== Configured overrides ($OVERRIDE_JSON) =="
-  local rc=0
-  python3 - "$OVERRIDE_JSON" <<PYEOF || rc=$?
-$(read_json_py)
+  local rc=0 prog
+  override_kind
+  if [[ $OVERRIDE_KIND == absent ]]; then
+    # "existed" used to come back from load_target; it now comes from the
+    # helper's `stat`, which tells missing from empty without opening
+    # anything. The printed line is unchanged.
+    echo "  (no override configured yet -- the file does not even exist)"
+  else
+    IFS= read -r -d '' prog <<'PYEOF' || true
 
 json_path = sys.argv[1]
 data, existed = load_target(json_path)
-
-if not existed:
-    print("  (no override configured yet -- the file does not even exist)")
-    raise SystemExit(0)
 
 monitors = data.get("monitors")
 monitors = monitors if isinstance(monitors, dict) else {}
@@ -599,6 +664,10 @@ for key in ("portrait", "landscape"):
     else:
         print(f"  {label} -> (invalid value, not a path: {value!r})")
 PYEOF
+    read_override
+    printf '%s' "$OVERRIDE_RAW" \
+      | "$PYTHON3" -I -c "$FILTER_PRELUDE$prog" "$OVERRIDE_JSON" || rc=$?
+  fi
 
   if [[ $rc -ne 0 ]]; then
     exit "$EXIT_UNREADABLE"
@@ -606,18 +675,34 @@ PYEOF
 
   echo
   echo "== Detected monitors (hyprctl monitors -j) =="
-  if command -v hyprctl >/dev/null 2>&1; then
-    local hypr_raw=""
-    hypr_raw="$(hyprctl monitors -j 2>/dev/null)" || hypr_raw=""
+  wpm_optional HYPRCTL
+  if [[ -n $HYPRCTL ]]; then
+    local hypr_raw="" hrc=0
+    # F5: the other unbounded consumer-side command substitution. Same
+    # treatment as `file` above -- producer-side cap, 5 s deadline, whole
+    # process group torn down on breach. 64 KiB is roughly two orders of
+    # magnitude above what a real desk produces.
+    hypr_raw="$(wpm_bounded "$WPM_MAX_HYPRCTL_BYTES" 5 -- "$HYPRCTL" monitors -j)" || hrc=$?
+    if (( hrc == 6 || hrc == 7 )); then
+      # LOUD, and no partial parse: a truncated prefix of that JSON would list
+      # a subset of the user's monitors as if it were all of them.
+      echo "  (hyprctl monitors -j exceeded ${WPM_MAX_HYPRCTL_BYTES} bytes or 5s -- refusing to parse a partial answer)" >&2
+      hypr_raw=""
+    elif (( hrc != 0 )); then
+      hypr_raw=""
+    fi
     # The JSON goes in via argv, not stdin: `hyprctl | python3 - <<EOF` would
     # make the heredoc become the python process's stdin, so
     # sys.stdin.read() would read the script itself and hyprctl would get
-    # SIGPIPE.
-    python3 - "$hypr_raw" <<'PYEOF'
+    # SIGPIPE. It is bounded to WPM_MAX_HYPRCTL_BYTES now, so argv cannot grow
+    # towards ARG_MAX either.
+    "$PYTHON3" -I - "$hypr_raw" "$WPM_MAX_MONITORS" "$WPM_MAX_MONITOR_NAME_BYTES" <<'PYEOF'
 import json
 import sys
 
 raw = sys.argv[1]
+max_monitors = int(sys.argv[2])
+max_name_bytes = int(sys.argv[3])
 try:
     monitors = json.loads(raw) if raw.strip() else []
 except ValueError as e:
@@ -627,11 +712,24 @@ except ValueError as e:
 if not isinstance(monitors, list):
     monitors = []
 
+# Cap the NUMBER of entries parsed, not just their shape: the byte cap bounds
+# the blob, but a blob of that size can still describe thousands of monitors.
+if len(monitors) > max_monitors:
+    print(
+        f"  (hyprctl reported {len(monitors)} monitors; showing the first {max_monitors})",
+        file=sys.stderr,
+    )
+    monitors = monitors[:max_monitors]
+
 for m in monitors:
     if not isinstance(m, dict):
         continue
     name = m.get("name")
     if not name:
+        continue
+    # ... and cap each NAME. The connector-name regex constrains the charset
+    # but says nothing about length.
+    if not isinstance(name, str) or len(name.encode("utf-8", "replace")) > max_name_bytes:
         continue
     width = m.get("width")
     height = m.get("height")
@@ -665,6 +763,13 @@ main() {
   shift || true
 
   case "$action" in
+    --locked)
+      local operation=${1:-}; shift || true
+      case "$operation" in
+        cmd_set_locked|cmd_set_orientation_locked|cmd_clear_locked|cmd_clear_orientation_locked)
+          "$operation" "$@" ;;
+        *) usage ;;
+      esac ;;
     set)             cmd_set "$@" ;;
     set-portrait)    cmd_set_orientation portrait "$@" ;;
     set-landscape)   cmd_set_orientation landscape "$@" ;;
