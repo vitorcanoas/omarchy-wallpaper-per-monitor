@@ -49,3 +49,7 @@ Thumbs.db
 /.continue/
 /.aider*
 /.github/copilot-instructions.md
+
+# Python validation caches
+__pycache__/
+*.py[cod]

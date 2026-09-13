@@ -142,6 +142,7 @@ from __future__ import annotations
 
 import ctypes
 import errno
+import fcntl
 import json
 import os
 import secrets
@@ -285,16 +286,25 @@ def sanitize(text: str) -> str:
 
 
 def write_fd(fd: int, data: bytes) -> None:
-    """os.write loop. Short writes are normal on a pipe, and a partial write
-    the caller then parses as a whole file is a correctness bug."""
+    """Bound writes too: a stalled consumer must not hold a supervisor alive."""
+    flags = fcntl.fcntl(fd, fcntl.F_GETFL)
+    fcntl.fcntl(fd, fcntl.F_SETFL, flags | os.O_NONBLOCK)
+    deadline = time.monotonic() + 1.0
+    poller = select.poll()
+    poller.register(fd, select.POLLOUT)
     offset = 0
-    while offset < len(data):
-        try:
-            offset += os.write(fd, data[offset:])
-        except BrokenPipeError:
-            # The consumer left. Every transaction is already committed or
-            # already rolled back by the time payload is emitted.
-            return
+    try:
+        while offset < len(data):
+            if time.monotonic() >= deadline:
+                fail("output consumer stopped reading", EXIT_DEADLINE)
+            try:
+                offset += os.write(fd, data[offset:])
+            except BlockingIOError:
+                poller.poll(50)
+            except BrokenPipeError:
+                return
+    finally:
+        fcntl.fcntl(fd, fcntl.F_SETFL, flags)
 
 
 def emit_line(text: str) -> None:
@@ -471,8 +481,8 @@ def open_directory_path(components: list[str], create: bool, mode: int,
             os.close(dirfd)
             dirfd = nextfd
             info = os.fstat(dirfd)
-            if owner_rule == "system":
-                if info.st_uid not in (0, os.geteuid()):
+            if owner_rule in ("system", "tool"):
+                if info.st_uid not in ((0,) if owner_rule == "tool" else (0, os.geteuid())):
                     fail("a parent directory is owned by another user")
                 if info.st_mode & 0o022:
                     fail("a parent directory is writable by another user")
@@ -885,9 +895,9 @@ def publish(dirfd: int, basename: str, data: bytes,
 def validate_tool(path: str, require_exec: bool) -> None:
     """The authoritative tool check: pin an executable by identity, not name.
 
-    Every parent from `/` is walked O_NOFOLLOW with uid in {0, euid} and no
-    group/other write bit; the file itself must be a regular file with the
-    same ownership and mode rule, plus the executable bit when required.
+    Every parent is walked O_NOFOLLOW and must be root-owned without group or
+    other write permission. The target must be a root-owned regular file with
+    the same mode rule, plus an executable bit when required.
 
     SYMLINK RULE, stated plainly. The obvious rule -- "a tool may be a symlink
     only within its own directory" -- cannot be used: on Debian and Ubuntu
@@ -907,7 +917,7 @@ def validate_tool(path: str, require_exec: bool) -> None:
         if not components:
             fail("tool path names the root directory")
         parent = open_directory_path(components[:-1], False, DIR_MODE_DEFAULT,
-                                     "system")
+                                     "tool")
         if parent is None:
             fail("tool does not exist", EXIT_ABSENT)
         try:
@@ -934,8 +944,8 @@ def validate_tool(path: str, require_exec: bool) -> None:
                 info = os.fstat(fd)
                 if not stat.S_ISREG(info.st_mode):
                     fail("tool is not a regular file")
-                if info.st_uid not in (0, os.geteuid()):
-                    fail("tool is owned by another user")
+                if info.st_uid != 0:
+                    fail("tool must be owned by root")
                 if info.st_mode & 0o022:
                     fail("tool is writable by another user")
                 if require_exec and not info.st_mode & 0o111:
@@ -1030,7 +1040,8 @@ def child_environment() -> dict[str, str]:
         if value is None:
             continue
         env[name] = value
-    env.setdefault("PATH", CHILD_PATH_FALLBACK)
+    env["PATH"] = "/usr/bin:/usr/share/omarchy/bin"
+    env["OMARCHY_PATH"] = "/usr/share/omarchy"
     return env
 
 
@@ -1077,71 +1088,47 @@ def reap_remaining() -> None:
             return
 
 
+def adopted_children() -> list[int]:
+    # Linux subreapers adopt descendants even when they leave our process group.
+    with open("/proc/self/task/%d/children" % os.getpid(), "rb", buffering=0) as stream:
+        data = stream.read(65537)
+    if len(data) > 65536:
+        fail("too many child processes to supervise")
+    return [int(value) for value in data.split()]
+
+
 def teardown(pid: int, pgid: int | None, grace_ms: int) -> None:
-    """SIGTERM -> grace -> SIGKILL on the GROUP, then reap to ECHILD.
-
-    grace_ms defaults to 1000 and Background.qml's watchdog is 2000, so the
-    helper always finishes escalating and reaping before QML gives up on the
-    helper itself. Inverting that ordering is how grandchildren escape.
-    """
+    """Terminate the group AND adopted descendants; verify reaping, boundedly."""
     signal_group(pgid, pid, signal.SIGTERM)
-    if wait_for(pid, grace_ms / 1000.0) == -1:
-        signal_group(pgid, pid, signal.SIGKILL)
-        wait_for(pid, 2.0)
-    reap_remaining()
-
-
-def group_alive(pgid: int) -> bool:
-    """Does the group still have members?
-
-    killpg(pgid, 0) delivers nothing; it only asks the kernel whether the group
-    exists. It is deliberately NOT used to decide whether a particular process
-    died -- a zombie answers signal 0 -- but a process group stops existing the
-    moment its last member is reaped, which is exactly the question here.
-    """
-    try:
-        os.killpg(pgid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        # Somebody else's now; treat it as present and let the TERM/KILL below
-        # fail harmlessly rather than pretending the group is gone.
-        return True
-    return True
+    # Signal the direct child too: it may not yet have completed setsid().
+    signal_group(None, pid, signal.SIGTERM)
+    deadline = time.monotonic() + grace_ms / 1000.0
+    kill_deadline = deadline + 2.0
+    while True:
+        reap_remaining()
+        children = adopted_children()
+        group_present = False
+        if pgid is not None:
+            try:
+                os.killpg(pgid, 0)
+                group_present = True
+            except ProcessLookupError:
+                pass
+        if not children and not group_present:
+            return
+        now = time.monotonic()
+        sig = signal.SIGKILL if now >= deadline else signal.SIGTERM
+        if group_present:
+            signal_group(pgid, pid, sig)
+        for child in children:
+            signal_group(None, child, sig)
+        if now >= kill_deadline:
+            fail("could not verify whole-process cleanup", EXIT_TRANSACTION)
+        time.sleep(0.01)
 
 
 def teardown_group_after_exit(pgid: int, grace_ms: int) -> None:
-    """F6 -- tear the group down on the SUCCESS path, after the direct child
-    has already exited and been reaped.
-
-    teardown() above escalates TERM -> KILL by watching the DIRECT child, so it
-    is useless once that child is gone: waitpid returns ECHILD immediately, the
-    KILL round never happens, and a grandchild that ignores SIGTERM survives.
-    This one watches the GROUP instead.
-
-    Why the success path needs this at all: a child can exit 0 having left a
-    grandchild behind with stdout redirected away. EOF then arrives on our pipe
-    (nothing holds the write end open), we collect exit status 0, and the
-    grandchild runs on -- orphaned, unbounded, outliving the supervisor that
-    was supposed to own it. That is precisely the shape of the stage-2
-    omarchy-theme-set call, which used to be deliberately backgrounded.
-
-    The group is checked BEFORE it is signalled. A pgid can only be recycled
-    once the group is empty, so an empty group means there is nothing of ours
-    left to kill and we must send nothing at all -- signalling a recycled pgid
-    would reach somebody else's processes.
-    """
-    if not group_alive(pgid):
-        reap_remaining()
-        return
-    signal_group(pgid, pgid, signal.SIGTERM)
-    end = time.monotonic() + max(grace_ms, 0) / 1000.0
-    while group_alive(pgid):
-        if time.monotonic() >= end:
-            signal_group(pgid, pgid, signal.SIGKILL)
-            break
-        time.sleep(0.01)
-    reap_remaining()
+    teardown(pgid, pgid, grace_ms)
 
 
 class Supervision:
@@ -1233,29 +1220,19 @@ def supervise(argv: list[str], stdin_data: bytes, *, deadline_ms: int,
     """
     if not argv:
         usage_error("no child argv after '--'")
-    # F9 -- yes, this is TWO resolutions of one pathname: validate_tool()
-    # walks argv[0] descriptor-relatively, and the execve() below then hands
-    # the same pathname back to the kernel, which resolves it again. That is
-    # the check-then-use pattern the per-component walk exists to avoid
-    # everywhere else in this file, and it is not exploitable here. Every
-    # argv[0] that reaches this function is an absolute path under /usr/bin or
-    # /usr/local/bin, supplied by the plugin's own resolve-once tool table, and
-    # validate_tool's parent-chain rule is what enforces that: every directory
-    # from / down to the tool must be owned by root or by us and must not be
-    # group- or other-writable. Nobody who is not already root or us can swap
-    # anything on that path between the two resolutions, and if they were, the
-    # walk would not be the weak link. Closing the gap properly would mean
-    # fexecve() on the descriptor validate_tool held -- which needs that
-    # descriptor plumbed out of it and /proc mounted -- and it buys nothing
-    # against this threat model. Left as-is, deliberately, so a future reader
-    # does not read it as an oversight.
+    # System executable names and every parent are root-owned and not writable
+    # by the session user. Configuration transactions use held fds separately.
     validate_tool(argv[0], require_exec=True)
     # F4 -- built in the PARENT, from an allowlist, and handed to execve below.
     # Nothing about the caller's own environment reaches the child implicitly.
     child_env = child_environment()
-    libc()  # warm the loader BEFORE forking
+    handle = libc()
+    if handle is None or handle.prctl(36, 1, 0, 0, 0) != 0:
+        fail("Linux child subreaper support is required")
+    supervisor_pid = os.getpid()
 
     out_r, out_w = os.pipe()
+    err_r, err_w = os.pipe()
     in_r, in_w = os.pipe()
     null_fd = os.open(os.devnull, os.O_WRONLY | os.O_CLOEXEC) if stderr_to_null else -1
 
@@ -1266,12 +1243,14 @@ def supervise(argv: list[str], stdin_data: bytes, *, deadline_ms: int,
                 os.setsid()
             handle = libc()
             if handle is not None:
-                handle.prctl(PR_SET_PDEATHSIG, signal.SIGTERM, 0, 0, 0)
+                if handle.prctl(PR_SET_PDEATHSIG, signal.SIGTERM, 0, 0, 0) != 0:
+                    os._exit(127)
+                if os.getppid() != supervisor_pid:
+                    os._exit(127)
             os.dup2(in_r, 0)
             os.dup2(out_w, 1)
-            if null_fd >= 0:
-                os.dup2(null_fd, 2)
-            for fd in (in_r, in_w, out_r, out_w):
+            os.dup2(null_fd if null_fd >= 0 else err_w, 2)
+            for fd in (in_r, in_w, out_r, out_w, err_r, err_w):
                 try:
                     os.close(fd)
                 except OSError:
@@ -1295,6 +1274,7 @@ def supervise(argv: list[str], stdin_data: bytes, *, deadline_ms: int,
     # --- parent ---
     os.close(in_r)
     os.close(out_w)
+    os.close(err_w)
     if null_fd >= 0:
         os.close(null_fd)
     # setsid() makes the child a group leader, so its pid IS its pgid. Without
@@ -1302,6 +1282,7 @@ def supervise(argv: list[str], stdin_data: bytes, *, deadline_ms: int,
     pgid = pid if use_setsid else None
 
     caps = Supervision(max_output_bytes, max_lines, max_line_bytes)
+    err_caps = Supervision(16384, 256, 4096)
     deadline = time.monotonic() + deadline_ms / 1000.0
     pending = stdin_data
     breach: str | None = None
@@ -1321,10 +1302,12 @@ def supervise(argv: list[str], stdin_data: bytes, *, deadline_ms: int,
         torn_down = True
         teardown(pid, pgid, grace_ms)
 
+    os.set_blocking(err_r, False)
     os.set_blocking(out_r, False)
     os.set_blocking(in_w, False)
     poller = select.poll()
     poller.register(out_r, select.POLLIN)
+    poller.register(err_r, select.POLLIN)
     if pending:
         poller.register(in_w, select.POLLOUT)
     else:
@@ -1348,14 +1331,17 @@ def supervise(argv: list[str], stdin_data: bytes, *, deadline_ms: int,
                     expired = True
                     break
                 for fd, event in poller.poll(int(min(remaining, 0.25) * 1000.0)):
-                    if fd == out_r and event & (select.POLLIN | select.POLLHUP):
-                        chunk = os.read(out_r, READ_CHUNK)
+                    if fd in (out_r, err_r) and event & (select.POLLIN | select.POLLHUP):
+                        chunk = os.read(fd, READ_CHUNK)
                         if not chunk:
-                            poller.unregister(out_r)
-                            os.close(out_r)
-                            out_r = -1
-                            break
-                        breach = caps.feed(chunk)
+                            poller.unregister(fd)
+                            os.close(fd)
+                            if fd == out_r:
+                                out_r = -1
+                            else:
+                                err_r = -1
+                            continue
+                        breach = (caps if fd == out_r else err_caps).feed(chunk)
                         if breach:
                             break
                     elif fd == in_w and event & select.POLLOUT:
@@ -1374,10 +1360,10 @@ def supervise(argv: list[str], stdin_data: bytes, *, deadline_ms: int,
                         poller.unregister(in_w)
                         os.close(in_w)
                         in_w = -1
-                if breach or out_r == -1:
+                if breach or (out_r == -1 and err_r == -1):
                     break
         finally:
-            for fd in (out_r, in_w):
+            for fd in (out_r, err_r, in_w):
                 if fd >= 0:
                     try:
                         os.close(fd)
@@ -1391,10 +1377,8 @@ def supervise(argv: list[str], stdin_data: bytes, *, deadline_ms: int,
             tear_down_once()
             fail("child exceeded the %d ms deadline" % deadline_ms, EXIT_DEADLINE)
 
-        # A floor of one second: stdout is closed, so the child is exiting; a
-        # zero-length wait here would report a bogus deadline breach for a child
-        # that simply had not been reaped yet.
-        status = wait_for(pid, max(1.0, deadline - time.monotonic()))
+        # Closing stdout does not grant extra runtime beyond the deadline.
+        status = wait_for(pid, max(0.0, deadline - time.monotonic()))
         if status == -1:
             tear_down_once()
             fail("child exceeded the %d ms deadline" % deadline_ms, EXIT_DEADLINE)
@@ -1411,6 +1395,8 @@ def supervise(argv: list[str], stdin_data: bytes, *, deadline_ms: int,
             torn_down = True
             teardown_group_after_exit(pgid, grace_ms)
 
+        if err_caps.data():
+            write_fd(2, err_caps.data())
         if status is not None:
             if os.WIFSIGNALED(status):
                 transaction_error("child was killed by signal %d" % os.WTERMSIG(status))
@@ -1692,6 +1678,7 @@ def remove_tree(dirfd: int, name: str, depth: int, max_entries: int) -> int:
         fail_os("could not open a subdirectory safely", error)
     removed = 0
     try:
+        validate_dirfd(subfd)
         entries = os.listdir(subfd)
         if len(entries) > max_entries:
             fail("directory holds more than %d entries" % max_entries)
@@ -1724,6 +1711,7 @@ def prune(dirfd: int, keep: dict, depth: int, max_entries: int) -> int:
             except OSError as error:
                 fail_os("could not open a subdirectory safely", error)
             try:
+                validate_dirfd(subfd)
                 removed += prune(subfd, rule, depth + 1, max_entries)
             finally:
                 os.close(subfd)
@@ -1907,15 +1895,25 @@ def command_resolve_link(opts: Options) -> None:
     dangling = False
     first = True
     for _ in range(hops + 1):
-        if not (resolved == root or resolved.startswith(root + "/")):
-            # The chain left the trusted subtree. Report where it pointed
-            # rather than walking directories we have no standing to validate.
+        inside = resolved == root or resolved.startswith(root.rstrip("/") + "/")
+        if not inside and not opts.flag("require-regular"):
+            # Link audits compare the destination string, without opening it.
             break
         relative = resolved[len(root):].lstrip("/")
-        if not relative:
+        if inside and not relative:
+            if opts.flag("require-regular"):
+                fail("target is a directory")
             break
         try:
-            dirfd, basename = open_parent(root, relative)
+            if inside and root != "/":
+                dirfd, basename = open_parent(root, relative)
+            else:
+                components = check_root(resolved)
+                dirfd = open_directory_path(components[:-1], False,
+                                            DIR_MODE_DEFAULT, "system")
+                if dirfd is None:
+                    fail("target parent does not exist", EXIT_ABSENT)
+                basename = components[-1]
         except ConfigError as error:
             # A missing directory BELOW the first hop means the link dangles.
             # `readlink -f` reports the path anyway, and install.sh's symlink
@@ -1961,6 +1959,29 @@ def command_resolve_link(opts: Options) -> None:
     if not resolved.isprintable():
         fail("resolved path contains control characters")
     emit_line(resolved)
+
+
+def command_lock_run(opts: Options) -> None:
+    rootfd = open_root(opts.require("root"))
+    dirfd = descend(rootfd, split_rel(opts.require("rel")), True, DIR_MODE_DEFAULT)
+    try:
+        end = time.monotonic() + 5.0
+        while True:
+            try:
+                fcntl.flock(dirfd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() >= end:
+                    fail("another wallpaper-monitor is writing", EXIT_TRANSACTION)
+                time.sleep(0.05)
+        if not opts.child or opts.child[0] != "/usr/bin/bash":
+            usage_error("lock-run requires the Bash CLI")
+        validate_tool(opts.child[0], True)
+        # exec preserves this fd and the lock until the complete CLI exits.
+        os.set_inheritable(dirfd, True)
+        os.execve(opts.child[0], opts.child, child_environment())
+    finally:
+        os.close(dirfd)
 
 
 def command_run(opts: Options) -> None:
@@ -2026,6 +2047,7 @@ SPEC: dict[str, tuple[set[str], set[str], set[str], bool]] = {
     "unlink": ({"root", "rel"}, set(), set(), False),
     "symlink": ({"root", "rel", "target"}, {"replace"}, set(), False),
     "resolve-link": ({"root", "rel", "max-hops"}, {"require-regular"}, set(), False),
+    "lock-run": ({"root", "rel"}, set(), set(), True),
     "run": ({"deadline-ms", "kill-grace-ms", "max-output-bytes", "max-lines",
              "max-line-bytes"}, {"setsid", "stderr-to-null"}, set(), True),
     "check-tool": (set(), set(), {"path"}, False),
@@ -2113,6 +2135,7 @@ def parse_argv(argv: list[str]) -> Options:
 
 
 HANDLERS = {
+    "lock-run": command_lock_run,
     "read": command_read,
     "stat": command_stat,
     "edit": command_edit,
@@ -2137,13 +2160,22 @@ def report(command: str, message: str, code: int) -> None:
     output shape that no caller parsed and no run exercised. `code` is kept in
     the signature because it is what the caller returns, not because it is
     printed.""" 
-    sys.stderr.write("%s: %s: %s\n"
-                     % (PROGNAME, sanitize(command), sanitize(message)))
+    try:
+        write_fd(2, ("%s: %s: %s\n" %
+                     (PROGNAME, sanitize(command), sanitize(message))).encode())
+    except (ConfigError, OSError):
+        pass  # Diagnostic failure must never block termination.
 
 
 def main(argv: list[str]) -> int:
     command = "?"
     try:
+        parent = os.getppid()
+        handle = libc()
+        if handle is None or handle.prctl(PR_SET_PDEATHSIG, signal.SIGTERM, 0, 0, 0) != 0:
+            fail("Linux parent-death notification is required")
+        if os.getppid() != parent:
+            raise SystemExit(143)
         opts = parse_argv(argv)
         command = opts.command
         HANDLERS[command](opts)
@@ -2176,6 +2208,8 @@ def terminate(signum: int, _frame: object) -> None:
     128+signum is the shell's own convention for "killed by N", so callers
     reading $? see what they expect.
     """
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
     raise SystemExit(128 + signum)
 
 

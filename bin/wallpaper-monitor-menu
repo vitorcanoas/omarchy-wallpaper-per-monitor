@@ -1,4 +1,4 @@
-#!/usr/bin/bash
+#!/usr/bin/bash -p
 # wallpaper-monitor-menu -- visual wallpaper picker, per monitor.
 #
 # Flow: pick MONITOR -> pick IMAGE -> apply via `wallpaper-monitor set`.
@@ -424,7 +424,7 @@ MSG
   else
     local choice=""
     # Canceling exits != 0 in omarchy-menu-select; not an error of ours.
-    choice="$("$OMARCHY_MENU_SELECT" "Monitor wallpaper" "${options[@]}")" || exit 0
+    choice="$(wpm_bounded 4096 120 -- "$OMARCHY_MENU_SELECT" "Monitor wallpaper" "${options[@]}")" || exit 0
     [[ -n $choice ]] || exit 0
 
     # The answer is "<label>\t<subtext>"; the subtext is the connector name.
@@ -467,7 +467,7 @@ MSG
   local image=""
   # Canceling prints empty (and may exit != 0); in both cases, exit 0 without
   # applying anything.
-  image="$("$OMARCHY_MENU_IMAGES" "${args[@]}" "$dir")" || exit 0
+  image="$(wpm_bounded 4096 120 -- "$OMARCHY_MENU_IMAGES" "${args[@]}" "$dir")" || exit 0
   [[ -n $image ]] || exit 0
 
   if [[ ! -f $image ]]; then

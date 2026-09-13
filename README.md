@@ -50,10 +50,15 @@ point.](#the-rotation-problem)
 - **Omarchy 4** with `omarchy-shell` (Quickshell)
 - **`jq`** — used by `install.sh` to edit `shell.json` safely
 - **`python3`** — used by the CLIs to parse `hyprctl` output and the config
-- **`rsync`** — used by `install.sh` to copy the plugin files
 
-`install.sh` checks for all three up front and stops with the package name if
+`install.sh` checks its required tools up front and stops with the package name if
 one is missing, rather than failing halfway through.
+
+Linux process supervision also requires `/proc` and child-subreaper support.
+Configuration paths must have real directories (no symlink components), owned
+by the user and not writable by group or others. Config files are limited to
+256 KiB; existing file modes are preserved. Overrides refresh within about two
+seconds. Interactive pickers close after 120 seconds without a selection.
 
 That is all you need. You can use this plugin perfectly well with wallpapers
 you already have.
@@ -68,6 +73,9 @@ cd omarchy-wallpaper-per-monitor
 DRY_RUN=1 ./install.sh   # preview first — changes nothing
 ./install.sh
 ```
+
+Wallpaper choices are independent of your Omarchy theme. Setting an override
+for a monitor does not change the theme.
 
 Then set a wallpaper per screen, without having to remember connector names:
 

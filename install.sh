@@ -1,4 +1,4 @@
-#!/usr/bin/bash
+#!/usr/bin/bash -p
 # OPTIONAL AND MANUAL. Nothing runs this for you: Omarchy has no install hook,
 # and `omarchy plugin remove` runs nothing either.
 #

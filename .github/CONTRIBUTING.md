@@ -18,25 +18,26 @@ multi-monitor setup before merging.
 ## Development setup
 
 Install Omarchy 4 and Quickshell, then add the plugin to your local Omarchy
-setup. There is no build step, no package manager and no test framework in
-this repo — the tree is bash + QML, and verification is manual:
+setup. There is no build step. Run the syntax and boundary checks:
 
 ```bash
 bash -n install.sh uninstall.sh bin/wp bin/wallpaper-monitor \
-  bin/wallpaper-monitor-menu   # syntax check
-
-shellcheck bin/* *.sh   # optional, if installed; not enforced anywhere
-
-DRY_RUN=1 ./install.sh    # preview install against a throwaway staging copy
-DRY_RUN=1 ./uninstall.sh  # preview uninstall
+  bin/wallpaper-monitor-menu bin/wallpaper-monitor-common.sh
+shellcheck -x install.sh uninstall.sh bin/wp bin/wallpaper-monitor \
+  bin/wallpaper-monitor-menu bin/wallpaper-monitor-common.sh
+python3 -B -m unittest discover -s tests -v
+DRY_RUN=1 ./install.sh
+DRY_RUN=1 ./uninstall.sh
+omarchy plugin validate .
 ```
+
+Tests use disposable homes and preserve the desktop configuration.
 
 For local iteration, run `./install.sh` for real (it is idempotent) to
 synchronize the tree into
 `~/.config/omarchy/plugins/vitorcanoas.background-per-monitor`, then restart
 `omarchy-shell` (or your session) to pick up changes to `Background.qml`.
-Changes to the JSON config the plugin watches (`FileView`, `watchChanges:
-true`) apply live, without a restart.
+Changes to the JSON config the plugin watches (bounded metadata polling) apply live, without a restart.
 
 Do not edit `/usr/share/omarchy`. Test changes through the user plugin copy
 and restore any wallpaper state before removing the plugin. Plugins run
@@ -72,8 +73,7 @@ changes.
 
 ## Merge expectations
 
-There is no CI in this repository — no `.github/workflows/`, no Makefile, no
-automated test suite (`tests/` is currently empty). Every pull request is
+There is no CI in this repository — no `.github/workflows/`, no Makefile, a Python regression suite under `tests/`. Every pull request is
 verified manually before it is merged: `bash -n` on any changed script,
 `shellcheck` where available, a `DRY_RUN=1` pass of `install.sh`/`uninstall.sh`
 for anything touching those scripts, and a deliberate diff review. This is a

@@ -268,20 +268,8 @@ Item {
 
   // ---- closed environment ------------------------------------------------
   //
-  // Process.environment / Process.clearEnvironment are deliberately NOT used.
-  // They are unverified for this Quickshell version (the approved Panel.qml
-  // does not use them and Quickshell is not installed where this was
-  // written), and naming a property a QML type does not have fails the WHOLE
-  // component at load time -- which for this file means no wallpaper at all.
-  // The environment is closed inside the child instead, by exec'ing the
-  // /usr/bin/env BINARY by absolute path for its -i flag. That is not the
-  // same thing as a "#!/usr/bin/env" shebang: nothing here is resolved
-  // through PATH, and env is named absolutely like every other program.
-  //
-  // -i drops the inherited environment entirely -- BASH_ENV, ENV, SHELLOPTS,
-  // BASHOPTS, GLOBIGNORE, CDPATH, IFS, LD_PRELOAD, LD_LIBRARY_PATH, LD_AUDIT,
-  // PYTHONPATH, PYTHONHOME and everything else -- and only the assignments
-  // written after it survive. It is an allowlist, not a denylist.
+  // Quickshell clears the environment before launching even /usr/bin/env,
+  // preventing loader variables from affecting that first executable.
   readonly property var helperEnvPrefix: [root.envBin, "-i",
                                           "PATH=/usr/bin:/bin",
                                           "HOME=" + root.home,
@@ -304,13 +292,14 @@ Item {
     "XDG_CURRENT_DESKTOP", "XDG_CONFIG_HOME", "XDG_CONFIG_DIRS",
     "XDG_DATA_HOME", "XDG_DATA_DIRS", "XDG_STATE_HOME", "XDG_CACHE_HOME",
     "WAYLAND_DISPLAY", "HYPRLAND_INSTANCE_SIGNATURE",
-    "DBUS_SESSION_BUS_ADDRESS", "OMARCHY_PATH",
+    "DBUS_SESSION_BUS_ADDRESS",
     "USER", "LOGNAME", "LANG", "LC_ALL",
     "XCURSOR_THEME", "XCURSOR_SIZE"
   ]
 
   function selectorEnvPrefix() {
-    var argv = [root.envBin, "-i", root.selectorPath, "HOME=" + root.home]
+    var argv = [root.envBin, "-i", root.selectorPath, "HOME=" + root.home,
+                "OMARCHY_PATH=/usr/share/omarchy"]
     for (var i = 0; i < root.sessionEnvNames.length; i++) {
       var name = root.sessionEnvNames[i]
       var value = Quickshell.env(name)
@@ -327,7 +316,7 @@ Item {
   // Ported from the approved Panel.qml: the caps and their SplitParser
   // consumption (241-324), the per-invocation watchdog and why it is armed on
   // launch rather than restarted from a poll (976-1063), and the TERM ->
-  // 2000 ms -> KILL escalation (1029-1047). The shapes and the reasoning are
+  // 4000 ms -> KILL escalation (1029-1047). The shapes and the reasoning are
   // kept recognisable on purpose so the two files diff cleanly.
   //
   // StdioCollector is never used here. It retains the entire stream and only
@@ -392,7 +381,7 @@ Item {
     proc.bpOutLines = lines + 1
   }
 
-  // signal(15) now, signal(9) after processKillTimer's 2000 ms. That 2000 is
+  // signal(15) now, signal(9) after processKillTimer's 4000 ms. That 4000 is
   // load-bearing and must stay ABOVE the helper's own --kill-grace-ms (1000,
   // its DEFAULT_KILL_GRACE_MS): the helper has to finish escalating TERM ->
   // KILL across its whole process group and waitpid it to ECHILD before this
@@ -439,8 +428,8 @@ Item {
 
   Timer {
     id: processKillTimer
-    // 2000 > the helper's 1000 ms kill grace -- see bpTerminate.
-    interval: 2000
+    // 4000 > the helper's 1000 ms grace plus 2000 ms reap deadline -- see bpTerminate.
+    interval: 4000
     repeat: false
     onTriggered: {
       var procs = [configReadProc, configStatProc, resolveLinkProc,
@@ -523,6 +512,8 @@ Item {
   }
 
   Process {
+    clearEnvironment: true
+    environment: ({})
     id: configReadProc
     property string bpOutText: ""
     property int bpOutChars: 0
@@ -651,6 +642,8 @@ Item {
   }
 
   Process {
+    clearEnvironment: true
+    environment: ({})
     id: configStatProc
     property string bpOutText: ""
     property int bpOutChars: 0
@@ -718,6 +711,8 @@ Item {
   }
 
   Process {
+    clearEnvironment: true
+    environment: ({})
     id: resolveLinkProc
     property string bpOutText: ""
     property int bpOutChars: 0
@@ -788,7 +783,7 @@ Item {
   // The helper's `run` is the supervisor. --setsid gives the picker its own
   // session so the helper can killpg the WHOLE tree rather than one pid;
   // --kill-grace-ms is passed explicitly at the value the helper already
-  // defaults to, so processKillTimer's 2000 can be read against it here
+  // defaults to, so processKillTimer's 4000 can be read against it here
   // instead of in another file; --stderr-to-null sends the CHILD's stderr to
   // /dev/null (the helper's own single bounded error line still reaches the
   // journal), because an interactive picker's diagnostics are unbounded and
@@ -812,11 +807,13 @@ Item {
 
   // The old script tested only `[[ -n $background ]]`, so whatever the picker
   // printed became the setter's argument. One line, printable, absolute.
-  function selectorChoice(raw) {
+  function selectorChoice(raw, theme) {
     var value = String(raw || "").trim()
     if (value === "" || value.length > 4096) return ""
     if (value.indexOf("\n") >= 0) return ""
-    if (value.charAt(0) !== "/") return ""
+    if (theme) {
+      if (!/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(value) || value.indexOf("..") >= 0) return ""
+    } else if (value.charAt(0) !== "/") return ""
     for (var i = 0; i < value.length; i++) {
       var code = value.charCodeAt(i)
       if (code < 0x20 || code === 0x7f) return ""
@@ -838,7 +835,7 @@ Item {
                    (proc.bpErrText || "no detail"))
     }
     if (stage === 1) {
-      var choice = ok ? root.selectorChoice(proc.bpOutText) : ""
+      var choice = ok ? root.selectorChoice(proc.bpOutText, proc.bpSetter === root.omarchyBin + "/omarchy-theme-set") : ""
       if (choice !== "") {
         proc.bpStage = 2
         // Stage 2 is budgeted DIFFERENTLY from stage 1, on purpose.
@@ -883,6 +880,8 @@ Item {
   }
 
   Process {
+    clearEnvironment: true
+    environment: ({})
     id: bgSelectorProc
     property string bpOutText: ""
     property int bpOutChars: 0
@@ -925,6 +924,8 @@ Item {
   }
 
   Process {
+    clearEnvironment: true
+    environment: ({})
     id: themeSelectorProc
     property string bpOutText: ""
     property int bpOutChars: 0
@@ -1053,7 +1054,7 @@ Item {
   //
   // Escalation is not skipped out of optimism, it is skipped because there is
   // nowhere to wait. Everywhere else in this file the escalation is TERM ->
-  // processKillTimer's 2000 ms -> KILL, and the 2000 deliberately exceeds the
+  // processKillTimer's 4000 ms -> KILL, and the 4000 deliberately exceeds the
   // helper's 1000 ms grace (see bpTerminate). A timer cannot fire during
   // destruction, so the only two options here are "TERM and give the helper
   // its grace" or "TERM immediately followed by KILL", and the second is the

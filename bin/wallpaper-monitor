@@ -1,4 +1,4 @@
-#!/usr/bin/bash
+#!/usr/bin/bash -p
 # wallpaper-monitor -- manages per-monitor (and per-orientation) wallpaper
 # overrides for the vitorcanoas.background plugin
 # (~/.config/omarchy/plugins/vitorcanoas.background).
@@ -108,163 +108,12 @@ EOF
 }
 
 # ---------------------------------------------------------------------------
-# Write serialization.
-#
-# The final replacement (mv) was already atomic, but the read-modify-write
-# cycle was not serialized: `wp h 3 & wp v 5 &` made both read the same old
-# JSON and the loser vanished from the file. The lock below covers
-# migrate+read+write end to end.
-#
-# DIRECTORY lock (mkdir), not `flock 9>file`: mkdir does not follow a symlink
-# in the final component, so the lock path is never opened through a link
-# planted by another process. Same technique already approved in PR #8 of
-# vitorcanoas/omarchy-nightlight (commit 78d9fb4), required by the Omarchy
-# marketplace maintainer.
-#
-# NOTHING about this block's LOGIC changed in the hardening pass. It is
-# byte-for-byte the lock stack the Omarchy marketplace maintainer already
-# accepted in vitorcanoas/omarchy-nightlight -- the /tmp sticky check, the
-# post-create revalidation, the atomic mkdir and the incomplete-lock recovery
-# are all still exactly as they were. The only edits are name-to-path
-# substitutions for finding 1 (see lock_tools below) and two `date`/`cat`
-# calls that became bash builtins.
-RUNTIME_DIR=""
-LOCK=""
-
-# --- Tools the lock stack cannot delegate --------------------------------
-# The preamble's table deliberately has no entry for stat/mkdir/rm/rmdir:
-# everywhere else in this plugin they are replaced by helper subcommands. The
-# lock is the one place they cannot be, and the reason is structural rather
-# than stylistic:
-#
-#   * the helper fstat-validates its --root and refuses a root it does not own
-#     with no group/other write bit. `/`, `/run/user` and `/tmp` -- the
-#     directories the lock necessarily lives under -- can therefore never be a
-#     --root, so `stat -c %a` on XDG_RUNTIME_DIR has no helper equivalent;
-#   * `mkdir --` here is the lock PRIMITIVE: it must FAIL when the directory
-#     already exists. `mkdir-chain` deliberately ignores EEXIST, which is the
-#     opposite of what a lock needs.
-#
-# So they are pinned here instead: absolute paths, never PATH, validated
-# through the same check-tool every other tool in the plugin goes through
-# (regular file, owner in {root, us}, no group/other write bit, every parent
-# from / walked O_NOFOLLOW). Resolved lazily, so read-only `list` never pays
-# for them.
-WPM_STAT=""
-WPM_MKDIR=""
-WPM_RM=""
-WPM_RMDIR=""
-lock_tools() {
-  [[ -z $WPM_STAT ]] || return 0
-  wpm_require SLEEP
-  local stat_path=/usr/bin/stat mkdir_path=/usr/bin/mkdir
-  local rm_path=/usr/bin/rm rmdir_path=/usr/bin/rmdir
-  if ! wpm_cfg check-tool --path "$stat_path" --path "$mkdir_path" \
-                          --path "$rm_path" --path "$rmdir_path" >/dev/null; then
-    wpm_die "the write lock needs stat, mkdir, rm and rmdir under /usr/bin"
-  fi
-  WPM_STAT=$stat_path
-  WPM_MKDIR=$mkdir_path
-  WPM_RM=$rm_path
-  WPM_RMDIR=$rmdir_path
-  readonly WPM_STAT WPM_MKDIR WPM_RM WPM_RMDIR
-}
-
-runtime_dir_is_private() {
-  local dir=${1-} mode
-  [[ -n $dir && -d $dir && ! -L $dir && -O $dir ]] || return 1
-  mode=$("$WPM_STAT" -c '%a' -- "$dir" 2>/dev/null) || return 1
-  [[ $mode == 700 ]]
-}
-
-# XDG_RUNTIME_DIR is a private directory by definition. When it is missing,
-# fall back to a per-user directory in /tmp, created with mode 0700 and
-# refused if another user already controls the name. Never fall back to a
-# global lock.
-prepare_runtime_dir() {
-  local candidate tmp_mode
-  if [[ -n ${XDG_RUNTIME_DIR:-} ]] && runtime_dir_is_private "${XDG_RUNTIME_DIR:-}"; then
-    RUNTIME_DIR=$XDG_RUNTIME_DIR
-  else
-    candidate="/tmp/omarchy-wallpaper-monitor-${EUID}"
-    [[ -d /tmp && ! -L /tmp && -w /tmp && -k /tmp ]] || return 1
-    tmp_mode=$("$WPM_STAT" -c '%a' -- /tmp 2>/dev/null) || return 1
-    (( 8#$tmp_mode & 01000 )) || return 1
-    [[ ! -L $candidate ]] || return 1
-    if [[ ! -e $candidate ]]; then
-      ( umask 077; "$WPM_MKDIR" -- "$candidate" ) 2>/dev/null || return 1
-    fi
-    runtime_dir_is_private "$candidate" || return 1
-    RUNTIME_DIR=$candidate
-  fi
-  LOCK="$RUNTIME_DIR/omarchy-wallpaper-monitor.lock.d"
-}
-
-acquire_lock() {
-  local path=$1 deadline=$((SECONDS + 5)) owner created now
-  while :; do
-    [[ ! -L $path && ( ! -e $path || -d $path ) ]] || return 1
-    if ( umask 077; "$WPM_MKDIR" -- "$path" ) 2>/dev/null; then
-      if printf '%s\n' "$$" >"$path/pid" 2>/dev/null; then
-        return 0
-      fi
-      "$WPM_RM" -f -- "$path/pid" 2>/dev/null || true
-      "$WPM_RMDIR" -- "$path" 2>/dev/null || true
-      return 1
-    fi
-
-    [[ ! -L $path && -d $path ]] || return 1
-    # Builtin `read`, not `cat`: one fewer PATH-resolved tool, and it reads ONE
-    # line instead of the whole file, so a pid file someone has grown to a
-    # gigabyte is no longer slurped into a shell variable.
-    # `2>/dev/null` FIRST: redirections are applied left to right, so putting
-    # it after `<"$path/pid"` would let the shell's own "No such file or
-    # directory" for a missing pid file escape to the real stderr.
-    owner=""
-    { read -r owner || true; } 2>/dev/null <"$path/pid" || owner=""
-    if [[ $owner =~ ^[0-9]+$ ]] && ! kill -0 "$owner" 2>/dev/null; then
-      "$WPM_RM" -f -- "$path/pid" 2>/dev/null || true
-      "$WPM_RMDIR" -- "$path" 2>/dev/null || true
-      continue
-    fi
-    if [[ ! $owner =~ ^[0-9]+$ ]]; then
-      # A SIGKILL between the mkdir and writing the pid leaves a valid lock
-      # with no owner. Do not remove a lock that may have just been born;
-      # past the normal acquisition timeout it is safe to recover this
-      # incomplete lock.
-      created=$("$WPM_STAT" -c '%Y' -- "$path" 2>/dev/null || echo 0)
-      printf -v now '%(%s)T' -1          # builtin, replaces `date +%s`
-      if [[ $created =~ ^[0-9]+$ && $now =~ ^[0-9]+$ ]] && (( now - created >= 5 )); then
-        "$WPM_RMDIR" -- "$path" 2>/dev/null || true
-        continue
-      fi
-    fi
-    (( SECONDS >= deadline )) && return 1
-    "$SLEEP" 0.05 || return 1          # LC_ALL=C is pinned by the preamble
-  done
-}
-
-release_lock() {
-  local path=${1-}
-  [[ -n $path && ! -L $path && -d $path ]] || return 0
-  "$WPM_RM" -f -- "$path/pid" 2>/dev/null || true
-  "$WPM_RMDIR" -- "$path" 2>/dev/null || true
-}
-
-# Runs "$@" while holding the write lock. Exits with a clear error if it
-# cannot serialize -- better to refuse than to write over someone else.
+# Hold the validated config directory open for the entire read/migrate/write
+# operation. flock is released by the kernel on exit; no stale pid file or
+# pathname-based lock cleanup is needed.
 with_lock() {
-  lock_tools
-  if ! prepare_runtime_dir; then
-    echo "error: could not prepare a private runtime directory for the lock; nothing was changed" >&2
-    exit "$EXIT_LOCK"
-  fi
-  if ! acquire_lock "$LOCK"; then
-    echo "error: another wallpaper-monitor is writing (lock: $LOCK); nothing was changed" >&2
-    exit "$EXIT_LOCK"
-  fi
-  trap 'release_lock "$LOCK"' EXIT
-  "$@"
+  wpm_cfg lock-run --root "$HOME" --rel "$OVERRIDE_DIR_REL" -- \
+    /usr/bin/bash -p "$WPM_CLI" --locked "$@"
 }
 
 # ---------------------------------------------------------------------------
@@ -914,6 +763,13 @@ main() {
   shift || true
 
   case "$action" in
+    --locked)
+      local operation=${1:-}; shift || true
+      case "$operation" in
+        cmd_set_locked|cmd_set_orientation_locked|cmd_clear_locked|cmd_clear_orientation_locked)
+          "$operation" "$@" ;;
+        *) usage ;;
+      esac ;;
     set)             cmd_set "$@" ;;
     set-portrait)    cmd_set_orientation portrait "$@" ;;
     set-landscape)   cmd_set_orientation landscape "$@" ;;

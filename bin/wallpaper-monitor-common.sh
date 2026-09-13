@@ -10,7 +10,7 @@
 # "$PYTHON3" -I -B /abs/path/to/helper.py, so its shebang is never consulted).
 # The missing executable bit is the control; there is no sentinel variable and
 # no runtime self-check for it. The three directly-executed CLIs keep an
-# ABSOLUTE shebang -- `#!/usr/bin/bash`, not `#!/usr/bin/env bash` and not
+# ABSOLUTE shebang -- `#!/usr/bin/bash -p`, not `#!/usr/bin/env bash` and not
 # `#!/bin/bash`: see the merged-/usr note in section 3 below. Background.qml
 # already pins /usr/bin/bash, so /usr/bin/bash is the spelling the
 # whole plugin agrees on.
@@ -102,17 +102,23 @@ if ! (return 0 2>/dev/null); then
   exit 1
 fi
 
-# --- 0. Exported shell functions are executable code ---------------------
-# A BASH_FUNC_x%% entry in the environment defines a function in THIS shell and
-# in every subshell it forks. It outranks anything we do later: an exported
-# `printf` or `wpm_die` would be live code injection into the middle of a
-# configuration-changing script. Nothing in this plugin is ever invoked with an
-# inherited function, so all of them go, before a single other statement runs.
-while read -r _wpm_decl _wpm_flags _wpm_fname _wpm_rest; do
-  [[ $_wpm_decl == declare && $_wpm_flags == *x* && -n ${_wpm_fname:-} ]] || continue
-  unset -f -- "$_wpm_fname" 2>/dev/null || true
-done < <(declare -Fx 2>/dev/null || true)
-unset -v _wpm_decl _wpm_flags _wpm_fname _wpm_rest
+# Entry points use bash -p so BASH_ENV, exported functions and shell options
+# cannot run before this preamble. Remove export attributes for every variable
+# outside the session allowlist before launching any external program.
+while IFS= read -r _wpm_name; do
+  case $_wpm_name in
+    HOME|USER|LOGNAME|PATH|LANG|LC_ALL|DRY_RUN|XDG_RUNTIME_DIR|XDG_SESSION_TYPE|\
+    XDG_SESSION_DESKTOP|XDG_CURRENT_DESKTOP|XDG_CONFIG_HOME|XDG_CONFIG_DIRS|\
+    XDG_DATA_HOME|XDG_DATA_DIRS|XDG_STATE_HOME|XDG_CACHE_HOME|WAYLAND_DISPLAY|\
+    HYPRLAND_INSTANCE_SIGNATURE|DBUS_SESSION_BUS_ADDRESS|XCURSOR_THEME|XCURSOR_SIZE)
+      ;;
+    *) export -n "${_wpm_name?}" ;;
+  esac
+done < <(compgen -e)
+unset _wpm_name
+export OMARCHY_PATH=/usr/share/omarchy
+# Never execute an interpreter supplied by the caller during bootstrap.
+PYTHON3=/usr/bin/python3
 
 # --- 1. Shell state -------------------------------------------------------
 # IFS: a hostile IFS (say `/`) turns every unquoted expansion into a splitter.
@@ -602,7 +608,7 @@ _wpm_resolve() {
   fi
 
   # Authoritative validation, batched into ONE helper invocation: regular
-  # file, executable, owner in {root, us}, no group/other write bit, and every
+  # file, executable, owner root, no group/other write bit, and every
   # parent from / walked O_NOFOLLOW under the same ownership and mode rule --
   # none of which bash can test. A symlinked final component is followed for
   # at most 8 hops, re-validating the whole chain at each one.

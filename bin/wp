@@ -1,4 +1,4 @@
-#!/usr/bin/bash
+#!/usr/bin/bash -p
 # wp - pick a wallpaper by number, per monitor.
 #   wp                 list both catalogues
 #   wp h 12            apply the 12th landscape image to the landscape monitor
