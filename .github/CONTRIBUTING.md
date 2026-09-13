@@ -73,15 +73,16 @@ changes.
 
 ## Merge expectations
 
-There is no CI in this repository — no `.github/workflows/`, no Makefile, a Python regression suite under `tests/`. Every pull request is
-verified manually before it is merged: `bash -n` on any changed script,
+The repository has a Python regression suite under `tests/`, but no hosted
+CI workflow. Before merging a pull request, run the suite and review the
+relevant checks: `bash -n` on any changed script,
 `shellcheck` where available, a `DRY_RUN=1` pass of `install.sh`/`uninstall.sh`
 for anything touching those scripts, and a deliberate diff review. This is a
 solo-maintained project, so an external approval is welcome but not required.
 Changes that affect override resolution, file watching or background
 transitions should include a reproducible manual verification on real
 hardware (ideally with a rotated monitor) described in the pull request,
-since there is no automated test to fall back on.
+because the Python regression suite does not exercise the display server.
 
 ## License
 

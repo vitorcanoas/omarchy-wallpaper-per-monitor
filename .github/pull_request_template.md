@@ -1,5 +1,5 @@
 <!--
-There is no CI in this repository: no workflows, no Makefile, no test suite.
+There is no CI in this repository: no workflows. Run the local regression suite and record results.
 Verification here is manual, so what you write below IS the verification
 record. Please do not delete the checklist — mark items N/A instead.
 -->
@@ -31,7 +31,8 @@ Commands actually run, with their results:
 $ bash -n install.sh uninstall.sh bin/wp bin/wallpaper-monitor \
     bin/wallpaper-monitor-menu
 
-$ shellcheck bin/* *.sh          # optional, not enforced
+$ shellcheck -x *.sh bin/wp bin/wallpaper-monitor bin/wallpaper-monitor-menu bin/wallpaper-monitor-common.sh
+$ python3 -B -m unittest discover -s tests -v
 
 $ DRY_RUN=1 ./install.sh
 $ DRY_RUN=1 ./uninstall.sh
@@ -46,7 +47,7 @@ $ DRY_RUN=1 ./uninstall.sh
 ### Manual verification on real hardware
 
 Required for anything affecting override resolution, file watching or
-background transitions — there is no automated test to fall back on.
+background transitions; the Python tests do not replace display testing.
 
 - **Omarchy version:**
 - **Monitor setup:** <!-- names, resolutions, orientation and `transform` values -->
